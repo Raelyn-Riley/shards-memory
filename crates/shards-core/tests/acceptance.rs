@@ -6,9 +6,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use shards_core::{
-    resolve, sample, Address, Error, Memory, Provenance, ResolveOptions, SetOptions,
-};
+use shards_core::{resolve, sample, Address, Error, Memory, Provenance, ResolveOptions};
 use tempfile::TempDir;
 
 /// Keep the user's global/system git config (signing, hooks, ...) out of tests.
@@ -34,8 +32,7 @@ fn addr(s: &str) -> Address {
 }
 
 fn set(mem: &Memory, a: &str, v: &str) -> String {
-    mem.set(&addr(a), v, &who("shard-a", "seed"), &SetOptions::default())
-        .unwrap()
+    mem.set(&addr(a), v, &who("shard-a", "seed")).unwrap()
 }
 
 /// Plain git, for assertions only (never used to write).
@@ -66,9 +63,6 @@ fn set_refuses_a_duplicate_address() {
             &addr("devices/rotoforge-ctl/ip"),
             "10.0.4.41",
             &who("shard-b", "oops"),
-            &SetOptions {
-                force_new_home: true,
-            },
         )
         .unwrap_err();
     assert!(matches!(err, Error::AlreadyExists { .. }), "{err}");
@@ -81,54 +75,21 @@ fn set_refuses_a_duplicate_address() {
 }
 
 #[test]
-fn set_refuses_a_likely_second_home_without_the_flag() {
+fn same_name_elsewhere_is_allowed_only_exact_address_is_refused() {
     let (_t, mem) = fresh();
     set(&mem, "devices/rotoforge-ctl/ip", "10.0.4.40");
-    let before = mem.commit_count().unwrap();
-
-    let err = mem
-        .set(
-            &addr("devices/rotoforge/ip"),
-            "10.0.4.40",
-            &who("shard-b", "dup?"),
-            &SetOptions::default(),
-        )
-        .unwrap_err();
-    match &err {
-        Error::LikelySecondHome {
-            others, section, ..
-        } => {
-            assert_eq!(section, "devices");
-            assert_eq!(
-                others,
-                &vec!["facts/devices/rotoforge-ctl/ip.md".to_string()]
-            );
-        }
-        e => panic!("expected LikelySecondHome, got {e}"),
-    }
-    assert!(err
-        .to_string()
-        .contains("facts/devices/rotoforge-ctl/ip.md"));
-    assert!(!mem.exists(&addr("devices/rotoforge/ip")).unwrap());
-    assert_eq!(mem.commit_count().unwrap(), before);
-
-    // A different section is not a second home.
+    // Same last segment, same section: a different fact. Near-duplicate
+    // detection belongs to the drift checker, not to `set`.
+    set(&mem, "devices/rotoforge/ip", "10.0.4.77");
     set(&mem, "birds/wren/ip", "10.0.9.9");
-
-    // With the flag it is allowed.
-    mem.set(
-        &addr("devices/rotoforge/ip"),
-        "10.0.4.77",
-        &who("shard-b", "really a second controller"),
-        &SetOptions {
-            force_new_home: true,
-        },
-    )
-    .unwrap();
     assert_eq!(
         mem.get(&addr("devices/rotoforge/ip")).unwrap().value,
         "10.0.4.77"
     );
+    assert!(matches!(
+        mem.set(&addr("devices/rotoforge/ip"), "x", &who("s", "w")),
+        Err(Error::AlreadyExists { .. })
+    ));
 }
 
 #[test]
@@ -136,12 +97,7 @@ fn set_refuses_a_fact_that_would_be_a_folder() {
     let (_t, mem) = fresh();
     set(&mem, "devices/ctl", "x");
     assert!(matches!(
-        mem.set(
-            &addr("devices/ctl/ip"),
-            "y",
-            &who("s", "w"),
-            &SetOptions::default()
-        ),
+        mem.set(&addr("devices/ctl/ip"), "y", &who("s", "w")),
         Err(Error::PathConflict { .. })
     ));
 }
@@ -311,7 +267,7 @@ fn history_only_grows_through_the_tool() {
 
     set(&mem, "devices/rotoforge-ctl/ip", "10.0.4.40");
     check(&mem, true);
-    let _ = mem.set(&a, "x", &who("s", "w"), &SetOptions::default()); // refused
+    let _ = mem.set(&a, "x", &who("s", "w")); // refused
     check(&mem, false);
     for v in ["10.0.4.41", "10.0.4.42", "10.0.4.43"] {
         mem.supersede(&a, v, &who("s", "w")).unwrap();
@@ -331,12 +287,7 @@ fn writes_refused_off_main() {
     let (_t, mem) = fresh();
     git(mem.root(), &["checkout", "-q", "-b", "side"]);
     let err = mem
-        .set(
-            &addr("devices/x/ip"),
-            "1",
-            &who("s", "w"),
-            &SetOptions::default(),
-        )
+        .set(&addr("devices/x/ip"), "1", &who("s", "w"))
         .unwrap_err();
     assert!(
         matches!(err, Error::NotOnMain(ref b) if b == "side"),

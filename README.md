@@ -52,7 +52,7 @@ Global: `-C, --memory <dir>` (or `SHARDS_MEMORY`) picks the memory and defaults 
 | --- | --- |
 | `mem init <dir>` creates a new memory (`facts/`, `soul/`, `people/`, README, first commit). | `mem init ~/flock-memory` |
 | `mem get <address>` prints the value, then `home: <path>`. An unknown address exits 1. | `mem get devices/rotoforge-ctl/ip` |
-| `mem set <address> <value> --why ...` creates a **new** fact. It refuses an existing address. It also refuses a same-named fact elsewhere in the section (a likely second home) and names it, unless `--force-new-home` is passed. | `mem set devices/rotoforge-ctl/ip 10.0.4.40 --why "first seen on the bench"` |
+| `mem set <address> <value> --why ...` creates a **new** fact. It refuses only an exact existing address (use `supersede`). Near-duplicates such as the same name elsewhere are left to the later drift checker, which flags them for a human. | `mem set devices/rotoforge-ctl/ip 10.0.4.40 --why "first seen on the bench"` |
 | `mem supersede <address> <value> --why ...` replaces an existing fact's value as one commit that touches only that file. | `mem supersede devices/rotoforge-ctl/ip 10.0.4.41 --why "moved to the new switch"` |
 | `mem history <address>` shows every version, newest first: time, commit, author, human, why and value. | `mem history devices/rotoforge-ctl/ip` |
 | `mem resolve [file\|-] [--annotate]` replaces every `{{fact:...}}` with the current value. `--annotate` gives `10.0.4.41 [devices/rotoforge-ctl/ip]`. Any unresolvable pointer is an error that names it. | `mem resolve notes/runbook.md --annotate` |

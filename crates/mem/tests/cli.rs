@@ -75,22 +75,10 @@ fn the_whole_slice_through_the_cli() {
         None,
     ));
     assert!(e.contains("already exists"), "{e}");
-    let e = err(&mem(
-        &m,
-        &["set", "devices/other/ip", "10.0.4.41", "--why", "x"],
-        None,
-    ));
-    assert!(e.contains("facts/devices/rotoforge-ctl/ip.md"), "{e}");
+    // Same name elsewhere is a different fact; only the exact address is refused.
     ok(&mem(
         &m,
-        &[
-            "set",
-            "devices/other/ip",
-            "10.0.4.41",
-            "--why",
-            "x",
-            "--force-new-home",
-        ],
+        &["set", "devices/other/ip", "10.0.4.41", "--why", "x"],
         None,
     ));
 

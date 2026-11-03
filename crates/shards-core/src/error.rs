@@ -15,18 +15,6 @@ pub enum Error {
     #[error("fact `{address}` already exists at {home}; use `mem supersede` to change it")]
     AlreadyExists { address: String, home: String },
 
-    #[error(
-        "refusing to create `{address}`: a fact with the same name already lives in section \
-         `{section}` at {}; this looks like a second home for one fact \
-         (pass --force-new-home if it really is a different fact)",
-        others.join(", ")
-    )]
-    LikelySecondHome {
-        address: String,
-        section: String,
-        others: Vec<String>,
-    },
-
     #[error("cannot create `{address}`: {reason}")]
     PathConflict { address: String, reason: String },
 

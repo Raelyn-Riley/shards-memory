@@ -21,5 +21,5 @@ pub mod sample;
 pub use address::Address;
 pub use error::{Error, Result};
 pub use fact::{Fact, FrontMatter};
-pub use memory::{Fact as StoredFact, HistoryEntry, Memory, Provenance, SetOptions};
+pub use memory::{Fact as StoredFact, HistoryEntry, Memory, Provenance};
 pub use pointer::{resolve, ResolveOptions};

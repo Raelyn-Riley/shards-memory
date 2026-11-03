@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use shards_core::{resolve, sample, Address, Memory, Provenance, ResolveOptions, SetOptions};
+use shards_core::{resolve, sample, Address, Memory, Provenance, ResolveOptions};
 
 #[derive(Parser)]
 #[command(name = "mem", version, about = "Read and write a shards memory")]
@@ -47,16 +47,13 @@ enum Cmd {
     },
     /// Print a fact's current value and its home path.
     Get { address: String },
-    /// Create a NEW fact (refuses if it exists; use supersede to change one).
+    /// Create a NEW fact (refuses an existing address; use supersede to change one).
     Set {
         address: String,
         /// The value; `-` reads it from stdin.
         value: String,
         #[arg(long)]
         why: String,
-        /// Create it even though a same-named fact lives elsewhere in the section.
-        #[arg(long)]
-        force_new_home: bool,
         #[command(flatten)]
         who: Who,
     },
@@ -119,17 +116,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             address,
             value,
             why,
-            force_new_home,
             who,
         } => {
             let mem = Memory::open(&cli.memory)?;
             let a = Address::parse(&address)?;
-            let commit = mem.set(
-                &a,
-                &read_value(value)?,
-                &prov(who, why),
-                &SetOptions { force_new_home },
-            )?;
+            let commit = mem.set(&a, &read_value(value)?, &prov(who, why))?;
             writeln!(out, "set {a} at {} ({})", a.home(), &commit[..12])?;
         }
         Cmd::Supersede {

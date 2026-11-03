@@ -12,7 +12,7 @@ use std::path::Path;
 
 use crate::address::Address;
 use crate::error::Result;
-use crate::memory::{Memory, Provenance, SetOptions};
+use crate::memory::{Memory, Provenance};
 
 /// splitmix64: tiny, stable, dependency-free PRNG (output never changes
 /// between versions, unlike some crates' generators).
@@ -162,15 +162,10 @@ pub fn generate_with_env(
         (8 << rng.below(4)).to_string(),
     ));
 
-    // Same-named facts under different birds/devices are legitimately
-    // different facts, so the generator always passes force_new_home.
-    let opts = SetOptions {
-        force_new_home: true,
-    };
     for (addr, value) in &facts {
         let a = Address::parse(addr)?;
         let p = prov(&mut rng, "seeded by gen-sample", stamp());
-        mem.set(&a, value, &p, &opts)?;
+        mem.set(&a, value, &p)?;
     }
 
     // A few supersedes, so history has something in it.

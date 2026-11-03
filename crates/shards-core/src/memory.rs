@@ -117,14 +117,6 @@ impl Provenance {
     }
 }
 
-/// Options for [`Memory::set`].
-#[derive(Debug, Clone, Default)]
-pub struct SetOptions {
-    /// Create the fact even though a fact with the same name already lives
-    /// elsewhere in the same section.
-    pub force_new_home: bool,
-}
-
 /// A fact as read from the memory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fact {
@@ -301,39 +293,17 @@ impl Memory {
         Ok(self.read_at("HEAD", address)?.is_some())
     }
 
-    /// Other facts in the same section with the same last segment.
-    pub fn likely_other_homes(&self, address: &Address) -> Result<Vec<Address>> {
-        Ok(self
-            .addresses()?
-            .into_iter()
-            .filter(|a| {
-                a != address && a.section() == address.section() && a.name() == address.name()
-            })
-            .collect())
-    }
-
     /// Create a new fact. Returns the commit id.
-    pub fn set(
-        &self,
-        address: &Address,
-        value: &str,
-        prov: &Provenance,
-        opts: &SetOptions,
-    ) -> Result<String> {
+    ///
+    /// Refuses only an exact existing address. Near-duplicates (the same name
+    /// elsewhere) are left to a later drift checker, which flags for a human.
+    pub fn set(&self, address: &Address, value: &str, prov: &Provenance) -> Result<String> {
         prov.validate(true)?;
         check_value(value)?;
         if self.exists(address)? {
             return Err(Error::AlreadyExists {
                 address: address.to_string(),
                 home: address.home(),
-            });
-        }
-        let others = self.likely_other_homes(address)?;
-        if !others.is_empty() && !opts.force_new_home {
-            return Err(Error::LikelySecondHome {
-                address: address.to_string(),
-                section: address.section().to_string(),
-                others: others.iter().map(Address::home).collect(),
             });
         }
         self.check_path_free(address)?;
