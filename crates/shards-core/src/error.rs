@@ -36,8 +36,57 @@ pub enum Error {
     #[error("{0} has uncommitted changes; refusing to write over them")]
     Dirty(String),
 
-    #[error("memory is on branch `{0}`, writes go to `main` only")]
+    #[error(
+        "this worktree is on branch `{0}`; writes go to `main` or to your own `shard/<id>` branch"
+    )]
     NotOnMain(String),
+
+    #[error("this is shard `{shard}`'s worktree; author `{author}` can't write here (leave --author/SHARDS_AUTHOR unset or use `{shard}`)")]
+    NotYourShard { shard: String, author: String },
+
+    #[error("no open shard `{0}`")]
+    UnknownShard(String),
+
+    #[error("shard `{0}` already exists (open, or its branch shard/{0} is kept); pick another id")]
+    ShardExists(String),
+
+    #[error(
+        "invalid shard id `{0}`: use a-z, 0-9, `-`, `_`, `.`, starting with a letter or digit"
+    )]
+    BadShardId(String),
+
+    #[error("{what} requires a human admin; `{human}` is not in [soul] admins in shards.toml")]
+    NotAdmin { what: String, human: String },
+
+    #[error("shard `{0}` has no pending soul proposal")]
+    NothingToApprove(String),
+
+    #[error("no open conflict for `{0}`")]
+    NoConflict(String),
+
+    #[error("`{target}` has conflicts from several shards ({}); pass --shard", shards.join(", "))]
+    AmbiguousConflict { target: String, shards: Vec<String> },
+
+    #[error("`{path}` can't be written with `mem put`: {reason}")]
+    BadPath { path: String, reason: String },
+
+    #[error("lock `{name}` is busy: {msg}")]
+    Locked { name: String, msg: String },
+
+    #[error("gave up waiting for lock `{name}` after {waited:.1}s: {msg}")]
+    LockTimeout {
+        name: String,
+        msg: String,
+        waited: f64,
+    },
+
+    #[error(
+        "lost lock `{0}` while working (lease expired and it was recovered); nothing was committed"
+    )]
+    LockLost(String),
+
+    #[error("bad shards.toml: {0}")]
+    Config(String),
 
     #[error("{0} is not a shards memory (no git repo with a facts/ directory)")]
     NotAMemory(PathBuf),

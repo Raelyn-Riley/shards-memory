@@ -44,18 +44,16 @@ fn quote(s: &str) -> String {
 impl Fact {
     pub fn render(&self) -> String {
         let f = &self.front;
-        let mut out = String::from("---\n");
-        out += &format!("address: {}\n", quote(&f.address));
-        out += &format!("updated: {}\n", quote(&f.updated));
-        out += &format!("author: {}\n", quote(&f.author));
+        let mut pairs = vec![
+            ("address", f.address.as_str()),
+            ("updated", f.updated.as_str()),
+            ("author", f.author.as_str()),
+        ];
         if let Some(h) = &f.human {
-            out += &format!("human: {}\n", quote(h));
+            pairs.push(("human", h.as_str()));
         }
-        out += &format!("why: {}\n", quote(&f.why));
-        out += "---\n";
-        out += &self.value;
-        out += "\n";
-        out
+        pairs.push(("why", f.why.as_str()));
+        render_front(&pairs, &format!("{}\n", self.value))
     }
 
     /// Parse a fact file. `path` is only used in error messages.
@@ -64,56 +62,75 @@ impl Fact {
             path: path.to_string(),
             reason: reason.to_string(),
         };
-        let rest = text
-            .strip_prefix("---\n")
-            .ok_or_else(|| bad("missing opening `---`"))?;
-        let end = rest
-            .find("\n---\n")
-            .or_else(|| rest.strip_suffix("\n---").map(|r| r.len()))
-            .ok_or_else(|| bad("missing closing `---`"))?;
-        let header = &rest[..end];
-        let body = rest[end..]
-            .strip_prefix("\n---\n")
-            .or_else(|| rest[end..].strip_prefix("\n---"))
-            .unwrap_or("");
-        let value = body.strip_suffix('\n').unwrap_or(body).to_string();
-
-        let (mut address, mut updated, mut author, mut human, mut why) =
-            (None, None, None, None, None);
-        for line in header.lines() {
-            if line.trim().is_empty() || line.trim_start().starts_with('#') {
-                continue;
-            }
-            let (key, raw) = line
-                .split_once(':')
-                .ok_or_else(|| bad(&format!("not a `key: value` line: {line:?}")))?;
-            let raw = raw.trim();
-            let val = if raw.starts_with('"') {
-                serde_json::from_str::<String>(raw)
-                    .map_err(|e| bad(&format!("bad quoted value for `{key}`: {e}")))?
-            } else {
-                raw.to_string()
-            };
-            match key.trim() {
-                "address" => address = Some(val),
-                "updated" => updated = Some(val),
-                "author" => author = Some(val),
-                "human" => human = Some(val).filter(|v| !v.is_empty()),
-                "why" => why = Some(val),
-                _ => {} // unknown keys are tolerated for forward compatibility
-            }
-        }
+        let (pairs, body) = parse_front(text, path)?;
+        let get = |k: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.clone())
+        };
+        let value = body.strip_suffix('\n').unwrap_or(&body).to_string();
         Ok(Fact {
             front: FrontMatter {
-                address: address.ok_or_else(|| bad("missing `address`"))?,
-                updated: updated.ok_or_else(|| bad("missing `updated`"))?,
-                author: author.ok_or_else(|| bad("missing `author`"))?,
-                human,
-                why: why.ok_or_else(|| bad("missing `why`"))?,
+                address: get("address").ok_or_else(|| bad("missing `address`"))?,
+                updated: get("updated").ok_or_else(|| bad("missing `updated`"))?,
+                author: get("author").ok_or_else(|| bad("missing `author`"))?,
+                human: get("human").filter(|v| !v.is_empty()),
+                why: get("why").ok_or_else(|| bad("missing `why`"))?,
             },
             value,
         })
     }
+}
+
+/// Render `---` front matter (every value JSON-quoted) followed by `body`.
+pub fn render_front(pairs: &[(&str, &str)], body: &str) -> String {
+    let mut out = String::from("---\n");
+    for (k, v) in pairs {
+        out += &format!("{k}: {}\n", quote(v));
+    }
+    out += "---\n";
+    out += body;
+    out
+}
+
+/// Split a file into its front-matter `key: value` pairs and the body.
+/// Values may be JSON-quoted or bare. Unknown keys are kept.
+pub fn parse_front(text: &str, path: &str) -> Result<(Vec<(String, String)>, String)> {
+    let bad = |reason: &str| Error::Malformed {
+        path: path.to_string(),
+        reason: reason.to_string(),
+    };
+    let rest = text
+        .strip_prefix("---\n")
+        .ok_or_else(|| bad("missing opening `---`"))?;
+    let end = rest
+        .find("\n---\n")
+        .or_else(|| rest.strip_suffix("\n---").map(|r| r.len()))
+        .ok_or_else(|| bad("missing closing `---`"))?;
+    let header = &rest[..end];
+    let body = rest[end..]
+        .strip_prefix("\n---\n")
+        .or_else(|| rest[end..].strip_prefix("\n---"))
+        .unwrap_or("");
+    let mut pairs = Vec::new();
+    for line in header.lines() {
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let (key, raw) = line
+            .split_once(':')
+            .ok_or_else(|| bad(&format!("not a `key: value` line: {line:?}")))?;
+        let raw = raw.trim();
+        let val = if raw.starts_with('"') {
+            serde_json::from_str::<String>(raw)
+                .map_err(|e| bad(&format!("bad quoted value for `{key}`: {e}")))?
+        } else {
+            raw.to_string()
+        };
+        pairs.push((key.trim().to_string(), val));
+    }
+    Ok((pairs, body.to_string()))
 }
 
 #[cfg(test)]
