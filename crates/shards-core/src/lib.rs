@@ -11,15 +11,20 @@
 //! wrapper only permits an allowlist of non-destructive subcommands.
 
 pub mod address;
+pub mod config;
 pub mod error;
 pub mod fact;
 pub mod git;
+pub mod lock;
 pub mod memory;
 pub mod pointer;
 pub mod sample;
+pub mod shard;
 
 pub use address::Address;
+pub use config::Config;
 pub use error::{Error, Result};
 pub use fact::{Fact, FrontMatter};
-pub use memory::{Fact as StoredFact, HistoryEntry, Memory, Provenance};
+pub use memory::{Context, Fact as StoredFact, HistoryEntry, Memory, Provenance};
 pub use pointer::{resolve, ResolveOptions};
+pub use shard::{Conflict, DinitReport, ShardInfo, ShardMeta, ShardStatus, Side, Take};
