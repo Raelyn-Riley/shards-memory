@@ -12,6 +12,7 @@
 
 pub mod activity;
 pub mod address;
+pub mod board;
 pub mod config;
 pub mod error;
 pub mod fact;
@@ -23,6 +24,7 @@ pub mod sample;
 pub mod shard;
 
 pub use address::Address;
+pub use board::Board;
 pub use config::Config;
 pub use error::{Error, Result};
 pub use fact::{Fact, FrontMatter};
