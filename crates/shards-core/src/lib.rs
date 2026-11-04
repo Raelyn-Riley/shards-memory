@@ -22,6 +22,7 @@ pub mod memory;
 pub mod pointer;
 pub mod sample;
 pub mod shard;
+pub mod watch;
 
 pub use address::Address;
 pub use board::Board;
@@ -31,3 +32,4 @@ pub use fact::{Fact, FrontMatter};
 pub use memory::{Context, Fact as StoredFact, HistoryEntry, Memory, Provenance};
 pub use pointer::{resolve, ResolveOptions};
 pub use shard::{Conflict, DinitReport, ShardInfo, ShardMeta, ShardStatus, Side, Take};
+pub use watch::{CoreContext, Event, PassReport, WakeOutcome};
