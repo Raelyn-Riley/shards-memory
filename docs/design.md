@@ -17,15 +17,15 @@ flowchart TB
     s1["Shard<br/>own branch of main<br/>one session, one person"]
     s2["Shard<br/>own branch of main<br/>one session, one person"]
     s3["Shard<br/>own branch of main<br/>one session, one person"]
-    s1 -- "status, dinit" --> core
-    s2 -- "status, dinit" --> core
-    s3 -- "status, dinit" --> core
+    s1 -- "observed, dinit" --> core
+    s2 -- "observed, dinit" --> core
+    s3 -- "observed, dinit" --> core
     core -. "bulletins, nudges" .-> s1
     core -. "bulletins, nudges" .-> s2
     core -. "bulletins, nudges" .-> s3
 ```
 
-Shards report up and dinit into main; the core pushes bulletins and nudges back down in real time.
+The core observes shards (it doesn't wait for them to report) and they dinit into main. Later, the core will push bulletins and nudges back down in real time.
 
 ## The memory: one home per fact, in git
 
@@ -65,13 +65,43 @@ A blocked writer is told who holds the lock and since when. A shard that crashes
 
 ## Awareness: the core always knows what every shard is doing
 
-The core decides what spreads between shards. Three channels carry it:
+The core has to know what every shard is doing, and it must not depend on the shard telling it. A shard can forget, be wrong, or spend effort on status that should go to its person. So awareness is **read, not reported**. Shards just keep working, and a cheap data layer watches them. Reasoning is expensive, so a model is woken only when the data meets a condition the operator configured.
 
-1. **Status (shard to core).** Every shard keeps a one-line gist for its person, "currently working on X," updated as it goes. The core sees a live board of all shards and can open any shard's branch for detail.
-2. **Nudges (core to specific shards).** When two gists overlap, the core tells both shards, which tell their people: "your user and another user are on the same thing; you should be talking."
-3. **Bulletins (core to every shard, in real time).** When a core decision lands in main, or something very important comes up, the core posts it. Every live shard sees it before its next reply, not at the next dinit.
+```mermaid
+flowchart LR
+    shards["Shards<br/>branches, worktrees, agent transcripts"]
+    observe["1. Observe<br/>git + activity source<br/>summaries only"]
+    data["2. Data core<br/>mem board, mem watch<br/>plain code, no model"]
+    reason["3. Reasoning core<br/>an external command<br/>woken only by a trigger"]
+    shards -- "read, never asked" --> observe --> data
+    data -- "events (deduped, cooled down)" --> reason
+    reason -- "mem core context" --> data
+```
 
-Bulletins ride a Claude Code hook that runs on every turn, the same way a timestamp can be injected into each turn today. That gives real-time delivery with no extra server.
+**1. Observe.** For each open shard the core reads two things:
+
+- **What it is changing.** This comes from git: facts, profiles and notes changed on its branch since the merge-base with main, plus uncommitted edits in its worktree (its work *in flight*).
+- **What it is doing.** This comes from an activity source. An `ActivitySource` trait keeps this independent of any one agent tool. The first source reads Claude Code session transcripts, which it finds from the shard's worktree path. A `none` source uses git only.
+
+Transcripts are read incrementally. Only the time and a short summary of each tool call are kept: the tool name plus a file basename, or 80 characters of a redacted command. Prompts, answers, file contents and tool results are never stored or shown. If a transcript is missing, the board still works from git. The shard's own one-line gist is still shown when there is one, but nothing depends on it.
+
+**2. Data core.** This is plain code and never calls a model.
+
+- **`mem board`** is one view of every open shard: who it is with, whether it is active, idle or stale, its facts in flight and its last few actions. It also lists **overlaps**:
+  - *same fact*: two shards have the same fact in flight, a conflict caught before dinit;
+  - *same section*: two shards are working in the same top-level section.
+
+  The board also lists open conflicts and pending soul proposals. Reading it takes no lock and never blocks a writer.
+- **`mem watch`** runs the board on a timer and checks configured **triggers**: same fact, same section, a stale shard with work in flight, an open conflict, a soul proposal. Each trigger can be switched on or off in `shards.toml`. A condition fires once while it holds and can fire again after it clears and comes back. Each firing is appended to an event log.
+
+**3. Reasoning core.** This is an external command the operator chooses, such as a model session. It is run only when events are pending. It is woken at most once per cooldown and only one runs at a time. It gets the pending events on stdin, and `mem core context` gives it the board plus those events in one document. A wake that fails or times out is logged, and its events wait for the next wake. Restarting the watcher doesn't re-fire anything.
+
+**Later: nudges and bulletins.** What the reasoning core decides still has to reach the shards. Two channels are planned:
+
+- **Nudges** tell two shards that their people are on the same thing and should talk.
+- **Bulletins** tell every live shard about a core decision before its next reply. They ride a Claude Code hook that runs on every turn.
+
+Delivery to shards is not built yet.
 
 ## Decisions
 
