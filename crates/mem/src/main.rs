@@ -8,8 +8,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use shards_core::board::{human_age, Board};
 use shards_core::{
-    resolve, sample, Address, DinitReport, Memory, Provenance, ResolveOptions, Side, Take,
+    resolve, sample, Address, DinitReport, Memory, PassReport, Provenance, ResolveOptions, Side,
+    Take, WakeOutcome,
 };
 
 #[derive(Parser)]
@@ -125,6 +127,21 @@ enum Cmd {
     /// Soul proposals.
     #[command(subcommand)]
     Soul(SoulCmd),
+    /// What every open shard is doing, read from git and its transcript.
+    Board {
+        /// Machine-readable output (format documented in the README).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Evaluate [triggers] every [awareness] poll_secs; wake the core when one fires.
+    Watch {
+        /// Run one pass and exit (for a timer or cron).
+        #[arg(long)]
+        once: bool,
+    },
+    /// The reasoning core's view.
+    #[command(subcommand)]
+    Core(CoreCmd),
     /// Test helpers.
     #[command(subcommand, hide = true)]
     Debug(DebugCmd),
@@ -161,6 +178,12 @@ enum SoulCmd {
         #[arg(long, default_value = "")]
         why: String,
     },
+}
+
+#[derive(Subcommand)]
+enum CoreCmd {
+    /// Print `mem board --json` plus the pending events, as one JSON document.
+    Context,
 }
 
 #[derive(Subcommand)]
@@ -242,6 +265,139 @@ fn print_dinit(out: &mut impl Write, r: &DinitReport) -> io::Result<()> {
             "shard {} stays open until its conflicts/proposals are settled",
             r.shard
         )?;
+    }
+    Ok(())
+}
+
+fn print_board(out: &mut impl Write, b: &Board) -> io::Result<()> {
+    if b.shards.is_empty() {
+        writeln!(out, "no open shards")?;
+    }
+    for s in &b.shards {
+        let others = s.in_flight.len() - s.facts_in_flight;
+        writeln!(
+            out,
+            "{}  {}  {}  last activity {} ago ({})  in flight: {} fact(s){}",
+            s.id,
+            s.human.as_deref().unwrap_or("-"),
+            s.state.as_str(),
+            human_age(s.age_secs),
+            s.last_activity_from,
+            s.facts_in_flight,
+            if others > 0 {
+                format!(", {others} other")
+            } else {
+                String::new()
+            }
+        )?;
+        if let Some(g) = &s.gist {
+            writeln!(out, "    gist:   {g}")?;
+        }
+        if !s.in_flight.is_empty() {
+            let items: Vec<String> = s
+                .in_flight
+                .iter()
+                .map(|f| {
+                    format!(
+                        "{}{}",
+                        f.address.as_deref().unwrap_or(&f.path),
+                        if f.uncommitted { "*" } else { "" }
+                    )
+                })
+                .collect();
+            writeln!(out, "    flight: {}  (* uncommitted)", items.join(", "))?;
+        }
+        for a in &s.recent_actions {
+            let age = chrono_age(&b.generated, &a.at);
+            if a.summary.is_empty() {
+                writeln!(out, "    {age:>4} ago  {}", a.tool)?;
+            } else {
+                writeln!(out, "    {age:>4} ago  {}  {}", a.tool, a.summary)?;
+            }
+        }
+    }
+    if !b.overlaps.is_empty() {
+        writeln!(out, "\noverlaps:")?;
+        for o in &b.overlaps {
+            writeln!(
+                out,
+                "  {:<12}  {}  shards {}{}",
+                o.kind.as_str(),
+                o.target,
+                o.shards.join(", "),
+                if o.humans.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", o.humans.join(", "))
+                }
+            )?;
+        }
+    }
+    if !b.conflicts.is_empty() {
+        writeln!(out, "\nopen conflicts:")?;
+        for c in &b.conflicts {
+            writeln!(out, "  {}  from {}  ({})", c.target, c.shard, c.record)?;
+        }
+    }
+    if !b.soul_proposals.is_empty() {
+        writeln!(out, "\nsoul proposals:")?;
+        for p in &b.soul_proposals {
+            writeln!(
+                out,
+                "  {} ({})  {}",
+                p.shard,
+                p.human.as_deref().unwrap_or("-"),
+                p.paths.join(", ")
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Age of RFC 3339 `at` relative to `now`, e.g. "4m".
+fn chrono_age(now: &str, at: &str) -> String {
+    use chrono::DateTime;
+    match (
+        DateTime::parse_from_rfc3339(now),
+        DateTime::parse_from_rfc3339(at),
+    ) {
+        (Ok(n), Ok(a)) => human_age((n - a).num_seconds().max(0)),
+        _ => "?".to_string(),
+    }
+}
+
+fn print_pass(out: &mut impl Write, r: &PassReport) -> io::Result<()> {
+    for e in &r.fired {
+        writeln!(out, "event {} {}: {}", e.id, e.kind.as_str(), e.summary)?;
+    }
+    match &r.wake {
+        WakeOutcome::Idle => {}
+        WakeOutcome::NoCommand => {
+            if !r.fired.is_empty() {
+                writeln!(
+                    out,
+                    "{} event(s) pending; no [wake] command set, nothing run",
+                    r.pending
+                )?;
+            }
+        }
+        WakeOutcome::Cooldown { until } => {
+            if !r.fired.is_empty() {
+                writeln!(
+                    out,
+                    "{} event(s) pending; cooldown until {until}",
+                    r.pending
+                )?;
+            }
+        }
+        WakeOutcome::Busy => writeln!(out, "another wake is running; events stay pending")?,
+        WakeOutcome::Delivered { events, secs } => {
+            writeln!(out, "woke the core: {events} event(s) in {secs:.1}s")?
+        }
+        WakeOutcome::Failed { events, reason } => writeln!(
+            out,
+            "wake failed ({reason}); {events} event(s) stay pending, see .shards/wake.log"
+        )?,
     }
     Ok(())
 }
@@ -433,6 +589,43 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 short(&commit)
             )?;
         }
+        Cmd::Board { json } => {
+            let mem = Memory::open(&cli.memory)?;
+            let b = mem.board(chrono::Utc::now())?;
+            if json {
+                writeln!(out, "{}", serde_json::to_string_pretty(&b)?)?;
+            } else {
+                print_board(&mut out, &b)?;
+            }
+        }
+        Cmd::Core(CoreCmd::Context) => {
+            let mem = Memory::open(&cli.memory)?;
+            let ctx = mem.core_context(chrono::Utc::now())?;
+            writeln!(out, "{}", serde_json::to_string_pretty(&ctx)?)?;
+        }
+        Cmd::Watch { once } => loop {
+            // Re-open every pass, so shards.toml changes apply at once.
+            let pass = Memory::open(&cli.memory).and_then(|m| {
+                let poll = m.config().awareness.poll();
+                Ok((m.watch_pass(chrono::Utc::now())?, poll))
+            });
+            match pass {
+                Ok((r, poll)) => {
+                    print_pass(&mut out, &r)?;
+                    out.flush()?;
+                    if once {
+                        break;
+                    }
+                    std::thread::sleep(poll);
+                }
+                Err(e) if once => return Err(e.into()),
+                Err(e) => {
+                    // Keep watching; the next pass may succeed.
+                    eprintln!("mem: watch pass failed: {e}");
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                }
+            }
+        },
         Cmd::Debug(DebugCmd::HoldLock { secs, holder }) => {
             let mem = Memory::open(&cli.memory)?;
             let guards = mem.lock_main(&[], &holder, None)?;
