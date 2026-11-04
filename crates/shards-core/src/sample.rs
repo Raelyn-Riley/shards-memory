@@ -236,3 +236,94 @@ pub fn generate_with_env(
         notes: notes.into_iter().map(|(p, _)| p).collect(),
     })
 }
+
+/// Markers planted in [`fake_transcript`]: prompt text, answer text, tool
+/// results, file contents and secrets. None of them may ever appear in any
+/// output or state file.
+pub const PLANTED: &[&str] = &[
+    "PLANTED",
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ3cmVuIn0.c2lnbmF0dXJlLWZha2U",
+    "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00",
+];
+
+/// Write a hand-made, entirely FAKE Claude Code transcript for a shard
+/// worktree, where Claude Code would put it under `projects`:
+/// `<projects>/<slug of worktree>/<session>.jsonl`. One record per minute
+/// from `start`. It contains a prompt, thinking, an answer, tool results and
+/// secrets (see [`PLANTED`]) next to ordinary tool calls (an `Edit` of
+/// `facts/devices/kiln-east/ip.md`, a few `Bash` commands, a `Grep`).
+pub fn fake_transcript(
+    projects: &Path,
+    worktree: &Path,
+    session: &str,
+    start: chrono::DateTime<chrono::Utc>,
+) -> Result<std::path::PathBuf> {
+    use serde_json::json;
+    let dir = projects.join(crate::activity::claude_slug(worktree));
+    std::fs::create_dir_all(&dir)?;
+    let wt = worktree.to_string_lossy();
+    let tool = |name: &str, input: serde_json::Value| {
+        json!({"type": "assistant", "cwd": wt, "sessionId": session,
+               "message": {"role": "assistant", "content": [
+                   {"type": "tool_use", "id": "toolu_fake", "name": name, "input": input}]}})
+    };
+    let records = vec![
+        json!({"type": "user", "cwd": wt, "sessionId": session, "message": {"role": "user",
+               "content": "PLANTED-PROMPT move the kiln controller; the wifi password is PLANTED-wifi"}}),
+        json!({"type": "assistant", "cwd": wt, "sessionId": session, "message": {"role": "assistant",
+               "content": [{"type": "thinking", "thinking": "PLANTED-THINKING"},
+                           {"type": "text", "text": "PLANTED-ANSWER on it"}]}}),
+        tool(
+            "Bash",
+            json!({"command": "curl -H \"Authorization: Bearer PLANTEDtok3n\" https://kiln.example.invalid/status",
+                            "description": "PLANTED-DESCRIPTION"}),
+        ),
+        json!({"type": "user", "cwd": wt, "sessionId": session, "message": {"role": "user",
+               "content": [{"type": "tool_result", "tool_use_id": "toolu_fake",
+                            "content": "PLANTED-RESULT ip 10.9.9.9"}]}}),
+        tool(
+            "Edit",
+            json!({"file_path": format!("{wt}/facts/devices/kiln-east/ip.md"),
+                            "old_string": "PLANTED-OLD", "new_string": "PLANTED-NEW"}),
+        ),
+        tool(
+            "Write",
+            json!({"file_path": format!("{wt}/notes/kiln-plan.md"),
+                             "content": "PLANTED-FILE-CONTENT"}),
+        ),
+        tool(
+            "Bash",
+            json!({"command": "export API_KEY=PLANTED-apikey-55; make check"}),
+        ),
+        tool(
+            "Bash",
+            json!({"command": "git clone https://wren:PLANTED-pw@git.example.invalid/kiln.git"}),
+        ),
+        tool(
+            "Bash",
+            json!({"command": format!("echo {} | jwt-decode", PLANTED[1])}),
+        ),
+        tool(
+            "Bash",
+            json!({"command": format!("sign --key {} build.tar", PLANTED[2])}),
+        ),
+        tool(
+            "Bash",
+            json!({"command": "mysql --password PLANTED-db-pw kiln"}),
+        ),
+        tool(
+            "Grep",
+            json!({"pattern": "PLANTED-PATTERN", "path": format!("{wt}/facts")}),
+        ),
+    ];
+    let mut text = String::new();
+    for (i, mut r) in records.into_iter().enumerate() {
+        let at = start + chrono::Duration::minutes(i as i64);
+        r["timestamp"] = json!(at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        text.push_str(&r.to_string());
+        text.push('\n');
+    }
+    let path = dir.join(format!("{session}.jsonl"));
+    std::fs::write(&path, text)?;
+    Ok(path)
+}
