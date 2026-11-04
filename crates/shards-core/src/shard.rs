@@ -669,6 +669,7 @@ impl Memory {
         }
         let _ = fs::remove_file(self.shards_dir().join(format!("{}.json", meta.id)));
         let _ = fs::remove_file(self.status_path(&meta.id));
+        self.forget_activity(&meta.id);
         report.closed = true;
         Ok(())
     }

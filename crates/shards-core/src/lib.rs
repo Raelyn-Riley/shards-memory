@@ -10,6 +10,7 @@
 //! `main`, made by this library. Nothing here can rewrite history: the git
 //! wrapper only permits an allowlist of non-destructive subcommands.
 
+pub mod activity;
 pub mod address;
 pub mod config;
 pub mod error;

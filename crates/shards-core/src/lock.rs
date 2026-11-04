@@ -455,6 +455,23 @@ impl FileMutex {
         f.lock()?;
         Ok(FileMutex(f))
     }
+
+    /// Like [`FileMutex::lock`], but `None` at once if someone holds it.
+    pub fn try_lock(path: &Path) -> Result<Option<FileMutex>> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let f = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)?;
+        match f.try_lock() {
+            Ok(()) => Ok(Some(FileMutex(f))),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+        }
+    }
 }
 
 impl Drop for FileMutex {
