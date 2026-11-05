@@ -36,9 +36,24 @@
 //! soul_proposal = true
 //!
 //! [wake]
+//! mode = "auto"          # "auto" | "command" | "pane"
 //! command = ""           # empty: record events, run nothing
 //! timeout_secs = 300
 //! cooldown_secs = 0      # at most one wake per this long; 0: no limit
+//!
+//! [core]
+//! command = "claude"     # the reasoning core, run in a tmux pane
+//! adapter = "claude-code" # "claude-code" | "plain"
+//! socket = ".shards/core/tmux.sock"
+//! session = "core"
+//! cwd = ""               # empty: the memory root
+//! watchdog = true        # mem watch restores a dead core
+//! start_timeout_secs = 60
+//! exit_timeout_secs = 30
+//! land_timeout_secs = 10
+//! keep_warm = false
+//! keep_warm_mins = 50
+//! keep_warm_quiet_limit = 8
 //! ```
 
 use std::path::Path;
@@ -195,9 +210,34 @@ impl Default for TriggersConfig {
     }
 }
 
+/// How `mem watch` wakes the reasoning core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WakeMode {
+    /// `pane` once a core has been started with `mem core start` (and not
+    /// stopped), otherwise `command`.
+    #[default]
+    Auto,
+    /// Run `[wake] command` with the events on stdin.
+    Command,
+    /// Type one short line into the core's tmux pane.
+    Pane,
+}
+
+impl WakeMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WakeMode::Auto => "auto",
+            WakeMode::Command => "command",
+            WakeMode::Pane => "pane",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WakeConfig {
+    pub mode: WakeMode,
     /// Run with `sh -c`; pending events as JSON on stdin. Empty: run nothing.
     pub command: String,
     pub timeout_secs: f64,
@@ -207,6 +247,7 @@ pub struct WakeConfig {
 impl Default for WakeConfig {
     fn default() -> Self {
         WakeConfig {
+            mode: WakeMode::Auto,
             command: String::new(),
             timeout_secs: 300.0,
             cooldown_secs: 0.0,
@@ -220,6 +261,88 @@ impl WakeConfig {
     }
 }
 
+/// How the core's session is driven: where its transcripts are, how it is
+/// resumed and how it is told to exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AdapterKind {
+    /// Claude Code: session ids from its transcripts, `--resume <id>`, `/exit`.
+    #[default]
+    ClaudeCode,
+    /// Any line-reading program: no session id, no resume, exit by `/exit`.
+    Plain,
+}
+
+impl AdapterKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AdapterKind::ClaudeCode => "claude-code",
+            AdapterKind::Plain => "plain",
+        }
+    }
+}
+
+/// The reasoning core as a long-lived session in a tmux pane.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CoreConfig {
+    /// The command line that starts the core (typed into the pane's shell).
+    pub command: String,
+    pub adapter: AdapterKind,
+    /// The tmux socket: relative to the memory root, or absolute.
+    pub socket: String,
+    /// The tmux session name.
+    pub session: String,
+    /// The core's working directory. Empty: the memory root.
+    pub cwd: String,
+    /// `mem watch` runs `mem core check` every pass once a core is started.
+    pub watchdog: bool,
+    /// How long a start, resume or handoff may take to come up and pin.
+    pub start_timeout_secs: f64,
+    /// How long the core may take to exit when told to.
+    pub exit_timeout_secs: f64,
+    /// How long to wait for a typed line to show in the pane / transcript.
+    pub land_timeout_secs: f64,
+    pub keep_warm: bool,
+    pub keep_warm_mins: f64,
+    pub keep_warm_quiet_limit: u32,
+}
+
+impl Default for CoreConfig {
+    fn default() -> Self {
+        CoreConfig {
+            command: "claude".to_string(),
+            adapter: AdapterKind::ClaudeCode,
+            socket: ".shards/core/tmux.sock".to_string(),
+            session: "core".to_string(),
+            cwd: String::new(),
+            watchdog: true,
+            start_timeout_secs: 60.0,
+            exit_timeout_secs: 30.0,
+            land_timeout_secs: 10.0,
+            keep_warm: false,
+            keep_warm_mins: 50.0,
+            keep_warm_quiet_limit: 8,
+        }
+    }
+}
+
+fn secs(s: f64) -> Duration {
+    Duration::from_secs_f64(s.max(0.05))
+}
+
+impl CoreConfig {
+    pub fn start_timeout(&self) -> Duration {
+        secs(self.start_timeout_secs)
+    }
+    pub fn exit_timeout(&self) -> Duration {
+        secs(self.exit_timeout_secs)
+    }
+    pub fn land_timeout(&self) -> Duration {
+        secs(self.land_timeout_secs)
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -230,6 +353,7 @@ pub struct Config {
     pub awareness: AwarenessConfig,
     pub triggers: TriggersConfig,
     pub wake: WakeConfig,
+    pub core: CoreConfig,
 }
 
 impl Config {
@@ -281,9 +405,24 @@ open_conflict = true    # a conflict record waits on main
 soul_proposal = true    # a soul proposal waits for an admin
 
 [wake]
-command = ""           # run when a trigger fires (sh -c, events as JSON on stdin); empty: record only
+mode = "auto"          # "auto": "pane" once `mem core start` has run, else "command" | "command" | "pane"
+command = ""           # command mode: run this (sh -c, events as JSON on stdin); empty: record only
 timeout_secs = 300
 cooldown_secs = 0      # wake the core at most once per this long; 0: no rate limit
+
+[core]                 # the reasoning core: one long-lived session in a tmux pane
+command = "claude"     # typed into the pane's shell by `mem core start`
+adapter = "claude-code" # "claude-code" (session ids, --resume <id>) | "plain"
+socket = ".shards/core/tmux.sock"  # its own tmux server
+session = "core"
+cwd = ""               # empty: the memory root
+watchdog = true        # mem watch restores a dead core and resumes its pinned session
+start_timeout_secs = 60
+exit_timeout_secs = 30
+land_timeout_secs = 10
+keep_warm = false      # ping an idle core to keep its prompt cache warm (for measuring)
+keep_warm_mins = 50
+keep_warm_quiet_limit = 8  # stop after this many pings with no real activity
 "#;
 
 #[cfg(test)]
@@ -328,5 +467,25 @@ mod tests {
         assert!(Config::parse("[wake]\ncmd = \"x\"\n").is_err());
         assert!(Config::parse("[activity]\nsource = \"vim\"\n").is_err());
         assert!(Config::parse("[awareness]\nidle = 5\n").is_err());
+    }
+
+    #[test]
+    fn core_section() {
+        let d = Config::parse(DEFAULT_TOML).unwrap();
+        assert_eq!(d.core.command, "claude");
+        assert_eq!(d.core.socket, ".shards/core/tmux.sock");
+        assert_eq!(d.core.session, "core");
+        assert!(d.core.watchdog && !d.core.keep_warm);
+        assert_eq!(d.core.keep_warm_mins, 50.0);
+        assert_eq!(d.core.keep_warm_quiet_limit, 8);
+        assert_eq!(d.wake.mode, WakeMode::Auto);
+        let e = Config::parse("").unwrap();
+        assert_eq!(e.core.command, "claude");
+        assert_eq!(e.wake.mode, WakeMode::Auto);
+        let c = Config::parse("[wake]\nmode = \"pane\"\n[core]\nadapter = \"plain\"\n").unwrap();
+        assert_eq!(c.wake.mode, WakeMode::Pane);
+        assert_eq!(c.core.adapter, AdapterKind::Plain);
+        assert!(Config::parse("[wake]\nmode = \"tty\"\n").is_err());
+        assert!(Config::parse("[core]\nkeepwarm = true\n").is_err());
     }
 }
