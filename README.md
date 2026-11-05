@@ -383,7 +383,9 @@ so every current condition fires once.
 ### Waking the core
 
 If `[wake] command` is set, a pass may wake the core. It does so when events are
-pending and the last wake was at least `cooldown_secs` ago. The pass then runs the
+pending and the last wake was at least `cooldown_secs` ago. The cooldown is 0 by
+default, so core reasoning isn't rate-limited unless you set one; dedupe still applies.
+The pass then runs the
 command with `sh -c` in the memory root, and gives it:
 
 - the **pending events as a JSON array on stdin**, and
@@ -416,7 +418,7 @@ chooses. For example (not run by anything in this repo, and never in tests):
 #   --allowedTools "Bash(mem core context)" >> "$SHARDS_MEMORY/.shards/core.log"
 # """
 timeout_secs = 300
-cooldown_secs = 600
+cooldown_secs = 0
 ```
 
 ## Config: `shards.toml`
@@ -459,7 +461,7 @@ soul_proposal = true
 [wake]
 command = ""            # empty: record events, run nothing
 timeout_secs = 300
-cooldown_secs = 600     # wake the core at most once per this long
+cooldown_secs = 0       # wake the core at most once per this long; 0: no limit
 ```
 
 Local state that is never committed lives in `.shards/`: `worktrees/`, `shards/`

@@ -94,7 +94,7 @@ Transcripts are read incrementally. Only the time and a short summary of each to
   The board also lists open conflicts and pending soul proposals. Reading it takes no lock and never blocks a writer.
 - **`mem watch`** runs the board on a timer and checks configured **triggers**: same fact, same section, a stale shard with work in flight, an open conflict, a soul proposal. Each trigger can be switched on or off in `shards.toml`. A condition fires once while it holds and can fire again after it clears and comes back. Each firing is appended to an event log.
 
-**3. Reasoning core.** This is an external command the operator chooses, such as a model session. It is run only when events are pending. It is woken at most once per cooldown and only one runs at a time. It gets the pending events on stdin, and `mem core context` gives it the board plus those events in one document. A wake that fails or times out is logged, and its events wait for the next wake. Restarting the watcher doesn't re-fire anything.
+**3. Reasoning core.** This is an external command the operator chooses, such as a model session. It is run only when events are pending. It is not rate-limited by default, but an optional cooldown can cap how often it is woken, and only one wake runs at a time. It gets the pending events on stdin, and `mem core context` gives it the board plus those events in one document. A wake that fails or times out is logged, and its events wait for the next wake. Restarting the watcher doesn't re-fire anything.
 
 **Later: nudges and bulletins.** What the reasoning core decides still has to reach the shards. Two channels are planned:
 

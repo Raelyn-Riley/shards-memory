@@ -38,7 +38,7 @@
 //! [wake]
 //! command = ""           # empty: record events, run nothing
 //! timeout_secs = 300
-//! cooldown_secs = 600    # at most one wake per this long
+//! cooldown_secs = 0      # at most one wake per this long; 0: no limit
 //! ```
 
 use std::path::Path;
@@ -209,7 +209,7 @@ impl Default for WakeConfig {
         WakeConfig {
             command: String::new(),
             timeout_secs: 300.0,
-            cooldown_secs: 600.0,
+            cooldown_secs: 0.0,
         }
     }
 }
@@ -283,7 +283,7 @@ soul_proposal = true    # a soul proposal waits for an admin
 [wake]
 command = ""           # run when a trigger fires (sh -c, events as JSON on stdin); empty: record only
 timeout_secs = 300
-cooldown_secs = 600    # wake the core at most once per this long
+cooldown_secs = 0      # wake the core at most once per this long; 0: no rate limit
 "#;
 
 #[cfg(test)]
@@ -315,6 +315,8 @@ mod tests {
         assert_eq!(d.activity.source, SourceKind::ClaudeCode);
         assert!(d.triggers.same_fact && !d.triggers.same_section);
         assert_eq!(d.wake.command, "");
+        assert_eq!(d.wake.cooldown_secs, 0.0);
+        assert_eq!(Config::parse("").unwrap().wake.cooldown_secs, 0.0);
         let c = Config::parse(
             "[activity]\nsource = \"none\"\n[triggers]\nsame_section = true\n[wake]\ncooldown_secs = 5\n",
         )
