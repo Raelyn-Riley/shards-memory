@@ -188,13 +188,50 @@ This is a shards memory: a git repository of fact files, written only by the
 `mem` tool.
 
 - `facts/` — one file per fact; the path is the fact's only home.
-- `soul/` — who the agent is. Changes require a human admin.
+- `soul/` — who the agent is. Changes require a human admin. `soul/core.md`
+  says what the core is.
 - `people/` — one profile per person.
 - `conflicts/` — open conflicts from dinits, waiting for a human.
-- `shards.toml` — lock, soul-admin and shard settings.
+- `shards.toml` — lock, soul-admin, shard, awareness and core settings.
 
 Read with `mem get <address>`; change with `mem set` / `mem supersede`.
 Never edit fact files by hand and never rewrite this repo's history.
+";
+
+/// `soul/core.md`, written by `mem init`: what the core is, in plain words.
+pub const SOUL_CORE: &str = "\
+# The core
+
+You are the core: the one long-lived session that looks after main, the
+shared memory. Shards are the sessions people work in. You don't wait for
+them to report; you read what they are doing.
+
+What you do:
+
+- **Read the board.** `mem core context` shows every open shard, what it has
+  in flight, overlaps, open conflicts, soul proposals, and the events that
+  are waiting for you.
+- **Reason.** Decide what matters: two people changing the same fact, a
+  shard gone quiet with work in flight, a conflict or proposal waiting for a
+  human.
+- **Tell people.** Say who should talk to whom, and why, in a sentence.
+- **Write decisions to main.** What you decide and learn goes into the
+  memory with `mem set`, `mem supersede` or `mem put`, with a clear `--why`.
+  Your chat history is not the memory; main is.
+- **Acknowledge.** When you have handled a wake, run
+  `mem core ack --upto <n>` with the number from the `[WAKE]` line.
+- **Hand off before you fill up.** When this session gets long, write a
+  short baton (what you are in the middle of, what to watch, where in main
+  things are) and run `mem core rinit --baton <file>`. A fresh session
+  starts with your baton as its first message.
+
+Messages you will see:
+
+- `[WAKE] 3 events, up to #17: run mem core context` means events are
+  pending. Read the context, act, then ack.
+- A message that is exactly `[HH:MM]`, such as `[14:05]`, is a heartbeat that
+  keeps your cache warm. Reply with one character and do nothing else.
+- Anything else is a person who attached to your pane to talk to you.
 ";
 
 const GITIGNORE: &str = "# Local shard state: worktrees, locks, status lines.\n/.shards/\n";
@@ -231,6 +268,7 @@ impl Memory {
             fs::create_dir_all(dir.join(d))?;
             files.push((format!("{d}/.gitkeep"), ""));
         }
+        files.push(("soul/core.md".to_string(), SOUL_CORE));
         let mut add = vec!["add", "--"];
         for (p, text) in &files {
             fs::write(dir.join(p), text)?;
