@@ -9,9 +9,10 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use shards_core::board::{human_age, Board};
+use shards_core::coresession::summarize_usage;
 use shards_core::{
-    resolve, sample, Address, DinitReport, Memory, PassReport, Provenance, ResolveOptions, Side,
-    Take, WakeOutcome,
+    resolve, sample, Address, CoreStatus, DinitReport, Memory, PassReport, Provenance,
+    ResolveOptions, Side, StartReport, Take, UsageEntry, WakeOutcome,
 };
 
 #[derive(Parser)]
@@ -184,6 +185,45 @@ enum SoulCmd {
 enum CoreCmd {
     /// Print `mem board --json` plus the pending events, as one JSON document.
     Context,
+    /// Start the core in its own tmux pane (a no-op if it is running).
+    Start {
+        /// Resume the pinned session instead of starting a fresh one.
+        #[arg(long)]
+        resume: bool,
+    },
+    /// Stop the core deliberately (the watchdog leaves it stopped).
+    Stop,
+    /// Pane, command, pinned session, last wake, watchdog and keep-warm.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Attach to the core's pane (prints the command when not on a terminal).
+    Attach {
+        /// Only print the tmux command.
+        #[arg(long)]
+        print: bool,
+    },
+    /// One watchdog pass (restore a dead core, resume its pinned session),
+    /// then keep-warm.
+    Check,
+    /// The core has handled the pending events (up to --upto).
+    Ack {
+        /// The newest event id handled (default: the newest it was woken for).
+        #[arg(long)]
+        upto: Option<u64>,
+    },
+    /// Hand off to a fresh session whose first message carries the baton.
+    Rinit {
+        /// The baton file; `-` reads stdin.
+        #[arg(long)]
+        baton: PathBuf,
+    },
+    /// Token usage of pings and wakes, by gap length, warm and cold.
+    Usage {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -398,6 +438,124 @@ fn print_pass(out: &mut impl Write, r: &PassReport) -> io::Result<()> {
             out,
             "wake failed ({reason}); {events} event(s) stay pending, see .shards/wake.log"
         )?,
+        WakeOutcome::Woken {
+            events,
+            upto,
+            confirmed,
+        } => writeln!(
+            out,
+            "woke the core in its pane: {events} event(s) up to #{upto}{}",
+            if *confirmed {
+                ""
+            } else {
+                " (typed; not confirmed in its transcript)"
+            }
+        )?,
+        WakeOutcome::AwaitingAck { events } => {
+            if !r.fired.is_empty() {
+                writeln!(
+                    out,
+                    "{events} event(s) pending; the core was woken, waiting for its ack"
+                )?
+            }
+        }
+        WakeOutcome::CoreDown => writeln!(
+            out,
+            "{} event(s) pending; the core is down, nothing typed",
+            r.pending
+        )?,
+    }
+    for n in &r.core {
+        writeln!(out, "core: {n}")?;
+    }
+    Ok(())
+}
+
+fn yes(b: bool) -> &'static str {
+    if b {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+fn print_status(out: &mut impl Write, s: &CoreStatus) -> io::Result<()> {
+    writeln!(
+        out,
+        "core: {}",
+        if s.started {
+            "started"
+        } else {
+            "not started (or stopped)"
+        }
+    )?;
+    writeln!(out, "  pane up:        {}", yes(s.pane_up))?;
+    writeln!(out, "  command alive:  {}", yes(s.command_alive))?;
+    writeln!(
+        out,
+        "  session:        {} ({})",
+        s.session_id.as_deref().unwrap_or("not pinned"),
+        s.adapter
+    )?;
+    writeln!(
+        out,
+        "  last wake:      {}",
+        s.last_wake.as_deref().unwrap_or("never")
+    )?;
+    writeln!(out, "  wake mode:      {}", s.wake_mode)?;
+    let wd = if !s.watchdog {
+        "off".to_string()
+    } else if s.gave_up {
+        format!(
+            "GAVE UP after {} failed restores; run mem core start",
+            s.failures
+        )
+    } else if s.failures > 0 {
+        format!("on, {} failed restore(s) in a row", s.failures)
+    } else {
+        "on".to_string()
+    };
+    writeln!(out, "  watchdog:       {wd}")?;
+    writeln!(out, "  keep-warm:      {}", s.keep_warm.state)?;
+    writeln!(out, "  attach:         {}", s.attach)?;
+    Ok(())
+}
+
+fn fmt_n(x: f64) -> String {
+    format!("{:.0}", x)
+}
+
+fn print_usage(out: &mut impl Write, entries: &[UsageEntry]) -> io::Result<()> {
+    let pings = entries.iter().filter(|e| e.kind == "ping").count();
+    let wakes = entries.iter().filter(|e| e.kind == "wake").count();
+    let replied = entries.iter().filter(|e| e.reply).count();
+    writeln!(
+        out,
+        "{} entries: {wakes} wake(s), {pings} ping(s), {replied} with a reply read",
+        entries.len()
+    )?;
+    let rows = summarize_usage(entries);
+    if rows.is_empty() {
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "{:<5} {:<7} {:<8} {:>4} {:>9} {:>9} {:>12} {:>12}",
+        "kind", "gap", "cache", "n", "avg in", "avg out", "avg c.read", "avg c.write"
+    )?;
+    for r in rows {
+        writeln!(
+            out,
+            "{:<5} {:<7} {:<8} {:>4} {:>9} {:>9} {:>12} {:>12}",
+            r.kind,
+            r.gap,
+            r.cache,
+            r.count,
+            fmt_n(r.avg_input),
+            fmt_n(r.avg_output),
+            fmt_n(r.avg_cache_read),
+            fmt_n(r.avg_cache_creation)
+        )?;
     }
     Ok(())
 }
@@ -602,6 +760,95 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let mem = Memory::open(&cli.memory)?;
             let ctx = mem.core_context(chrono::Utc::now())?;
             writeln!(out, "{}", serde_json::to_string_pretty(&ctx)?)?;
+        }
+        Cmd::Core(CoreCmd::Start { resume }) => {
+            let mem = Memory::open(&cli.memory)?;
+            match mem.core_start(resume)? {
+                StartReport::AlreadyRunning { session_id } => writeln!(
+                    out,
+                    "core already running (session {}); nothing to do",
+                    session_id.as_deref().unwrap_or("not pinned")
+                )?,
+                StartReport::Started {
+                    session_id,
+                    resumed,
+                } => {
+                    writeln!(
+                        out,
+                        "core {} in its pane; session {}",
+                        if resumed { "resumed" } else { "started" },
+                        session_id.as_deref().unwrap_or("not pinned")
+                    )?;
+                    writeln!(out, "attach: {}", mem.core_attach_command()?.join(" "))?;
+                }
+            }
+        }
+        Cmd::Core(CoreCmd::Stop) => {
+            let mem = Memory::open(&cli.memory)?;
+            if mem.core_stop()? {
+                writeln!(out, "core stopped; the watchdog will leave it stopped")?;
+            } else {
+                writeln!(out, "core was not running")?;
+            }
+        }
+        Cmd::Core(CoreCmd::Status { json }) => {
+            let mem = Memory::open(&cli.memory)?;
+            let s = mem.core_status(chrono::Utc::now())?;
+            if json {
+                writeln!(out, "{}", serde_json::to_string_pretty(&s)?)?;
+            } else {
+                print_status(&mut out, &s)?;
+            }
+        }
+        Cmd::Core(CoreCmd::Attach { print }) => {
+            use std::io::IsTerminal;
+            let mem = Memory::open(&cli.memory)?;
+            let cmd = mem.core_attach_command()?;
+            if print || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+                writeln!(out, "{}", cmd.join(" "))?;
+            } else {
+                drop(out);
+                mem.core_attach()?;
+                return Ok(());
+            }
+        }
+        Cmd::Core(CoreCmd::Check) => {
+            let mem = Memory::open(&cli.memory)?;
+            let r = mem.core_check(chrono::Utc::now())?;
+            if r.notes.is_empty() {
+                writeln!(out, "core ok (or not started); nothing to do")?;
+            }
+            for n in r.notes {
+                writeln!(out, "{n}")?;
+            }
+        }
+        Cmd::Core(CoreCmd::Ack { upto }) => {
+            let mem = Memory::open(&cli.memory)?;
+            let (done, left) = mem.core_ack(upto, chrono::Utc::now())?;
+            writeln!(out, "acknowledged {done} event(s); {left} still pending")?;
+        }
+        Cmd::Core(CoreCmd::Rinit { baton }) => {
+            let mem = Memory::open(&cli.memory)?;
+            let text = read_input(Some(baton))?;
+            let id = mem.core_rinit(&text)?;
+            writeln!(
+                out,
+                "handed off; new session {}",
+                id.as_deref().unwrap_or("(no id)")
+            )?;
+        }
+        Cmd::Core(CoreCmd::Usage { json }) => {
+            let mem = Memory::open(&cli.memory)?;
+            let entries = mem.core_usage(chrono::Utc::now())?;
+            if json {
+                let doc = serde_json::json!({
+                    "entries": entries.len(),
+                    "rows": summarize_usage(&entries),
+                });
+                writeln!(out, "{}", serde_json::to_string_pretty(&doc)?)?;
+            } else {
+                print_usage(&mut out, &entries)?;
+            }
         }
         Cmd::Watch { once } => loop {
             // Re-open every pass, so shards.toml changes apply at once.

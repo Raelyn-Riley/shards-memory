@@ -52,7 +52,8 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::board::{Board, OverlapKind, State, BOARD_FORMAT};
-use crate::config::TriggersConfig;
+use crate::config::{TriggersConfig, WakeMode};
+use crate::coresession::{Landed, PaneWake};
 use crate::error::Result;
 use crate::lock::FileMutex;
 use crate::memory::Memory;
@@ -68,6 +69,8 @@ pub enum EventKind {
     StaleWithWork,
     OpenConflict,
     SoulProposal,
+    /// The core watchdog gave up restoring the core.
+    CoreDown,
 }
 
 impl EventKind {
@@ -78,6 +81,7 @@ impl EventKind {
             EventKind::StaleWithWork => "stale-with-work",
             EventKind::OpenConflict => "open-conflict",
             EventKind::SoulProposal => "soul-proposal",
+            EventKind::CoreDown => "core-down",
         }
     }
 }
@@ -119,6 +123,11 @@ pub struct WatchState {
     pub last_wake: Option<String>,
     pub next_id: u64,
     pub last_pass: Option<String>,
+    /// Pane mode: the newest event id the core has been woken for. A pane
+    /// wake happens only when a pending event is newer, so the same pending
+    /// set never wakes twice. Events stay pending until `mem core ack`.
+    #[serde(default)]
+    pub woken_upto: Option<u64>,
 }
 
 fn rfc3339(t: DateTime<Utc>) -> String {
@@ -264,6 +273,20 @@ pub enum WakeOutcome {
         events: usize,
         reason: String,
     },
+    /// Pane mode: a line was typed into the core's pane. The events stay
+    /// pending until the core runs `mem core ack`.
+    Woken {
+        events: usize,
+        upto: u64,
+        confirmed: bool,
+    },
+    /// Pane mode: the core was already woken for every pending event and
+    /// hasn't acknowledged yet.
+    AwaitingAck {
+        events: usize,
+    },
+    /// Pane mode: the core isn't running; events stay pending.
+    CoreDown,
 }
 
 #[derive(Debug, Clone)]
@@ -272,6 +295,8 @@ pub struct PassReport {
     /// Pending after this pass.
     pub pending: usize,
     pub wake: WakeOutcome,
+    /// What the core watchdog and keep-warm did this pass.
+    pub core: Vec<String>,
 }
 
 /// `mem core context`: everything a woken core needs, in one document.
@@ -281,9 +306,11 @@ pub struct CoreContext {
     pub board: Board,
     /// Events not yet delivered to (or not yet handled by) a wake.
     pub events: Vec<Event>,
+    /// Pane mode: after handling these, run `mem core ack --upto <this>`.
+    pub ack_upto: Option<u64>,
 }
 
-fn append_line(path: &Path, line: &str) -> Result<()> {
+pub(crate) fn append_line(path: &Path, line: &str) -> Result<()> {
     if let Some(p) = path.parent() {
         fs::create_dir_all(p)?;
     }
@@ -412,8 +439,79 @@ impl Memory {
         Ok(CoreContext {
             format: BOARD_FORMAT,
             board,
+            ack_upto: events.iter().map(|e| e.id).max(),
             events,
         })
+    }
+
+    /// Forget which pending set the core was woken for, so the pending
+    /// events wake it again (after a restore or a handoff).
+    pub(crate) fn watch_reset_woken(&self) -> Result<()> {
+        let main = self.main()?;
+        let _g = FileMutex::lock(&main.state_dir().join("watch.lock"))?;
+        let mut st = main.watch_state()?;
+        if st.woken_upto.is_some() {
+            st.woken_upto = None;
+            main.save_watch_state(&st)?;
+        }
+        Ok(())
+    }
+
+    /// Record a one-off event (not a trigger condition).
+    pub(crate) fn watch_record_event(
+        &self,
+        kind: EventKind,
+        key: &str,
+        summary: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Event> {
+        let main = self.main()?;
+        let _g = FileMutex::lock(&main.state_dir().join("watch.lock"))?;
+        let mut st = main.watch_state()?;
+        st.next_id += 1;
+        let e = Event {
+            id: st.next_id,
+            time: rfc3339(now),
+            kind,
+            shards: vec![],
+            addresses: vec![],
+            humans: vec![],
+            key: key.to_string(),
+            summary: summary.to_string(),
+        };
+        append_line(
+            &main.events_path(),
+            &serde_json::to_string(&e).expect("serializable"),
+        )?;
+        st.pending.push(e.clone());
+        main.save_watch_state(&st)?;
+        Ok(e)
+    }
+
+    /// `mem core ack`: the core has handled the pending events up to `upto`
+    /// (default: the newest one it was woken for). Returns (handled, still
+    /// pending).
+    pub fn core_ack(&self, upto: Option<u64>, now: DateTime<Utc>) -> Result<(usize, usize)> {
+        let main = self.main()?;
+        let _g = FileMutex::lock(&main.state_dir().join("watch.lock"))?;
+        let mut st = main.watch_state()?;
+        let Some(upto) = upto.or(st.woken_upto) else {
+            return Err(crate::error::Error::Core(
+                "the core hasn't been woken; pass --upto <event id>".into(),
+            ));
+        };
+        let before = st.pending.len();
+        st.pending.retain(|e| e.id > upto);
+        let done = before - st.pending.len();
+        main.save_watch_state(&st)?;
+        main.wake_log(
+            now,
+            &format!(
+                "ack: core handled {done} event(s) up to #{upto}; {} still pending",
+                st.pending.len()
+            ),
+        )?;
+        Ok((done, st.pending.len()))
     }
 
     /// One watch pass as of `now`: evaluate triggers, record events, maybe
@@ -421,9 +519,23 @@ impl Memory {
     /// reported in the outcome, not as an error.
     pub fn watch_pass(&self, now: DateTime<Utc>) -> Result<PassReport> {
         let main = self.main()?;
+        let started = main.core_started();
+        let mut core_notes = Vec::new();
+        // The watchdog first, so a restored core can be woken this pass.
+        if started && main.config.core.watchdog {
+            match main.core_watchdog(now) {
+                Ok(r) => core_notes.extend(r.notes),
+                Err(e) => core_notes.push(format!("watchdog error: {e}")),
+            }
+        }
         let board = main.board(now)?;
         let conds = conditions(&board, &main.config.triggers);
         let wake_cfg = main.config.wake.clone();
+        let pane = match wake_cfg.mode {
+            WakeMode::Pane => true,
+            WakeMode::Command => false,
+            WakeMode::Auto => started,
+        };
         let state_dir = main.state_dir();
 
         // Phase 1: record (short, under watch.lock).
@@ -448,10 +560,15 @@ impl Memory {
             st.last_pass = Some(rfc3339(now));
             let mut deliver = Vec::new();
             let mut guard = None;
+            let newest = st.pending.iter().map(|e| e.id).max().unwrap_or(0);
             // `None`: this pass wakes the core.
             let outcome = if st.pending.is_empty() {
                 Some(WakeOutcome::Idle)
-            } else if wake_cfg.command.trim().is_empty() {
+            } else if pane && st.woken_upto.is_some_and(|w| w >= newest) {
+                Some(WakeOutcome::AwaitingAck {
+                    events: st.pending.len(),
+                })
+            } else if !pane && wake_cfg.command.trim().is_empty() {
                 Some(WakeOutcome::NoCommand)
             } else if let Some(until) = st
                 .cooldown_until(wake_cfg.cooldown_secs)
@@ -465,8 +582,12 @@ impl Memory {
                     None => Some(WakeOutcome::Busy),
                     Some(g) => {
                         // Claim the wake now, so the cooldown holds even
-                        // for a pass that starts while this one runs.
+                        // for a pass that starts while this one runs, and
+                        // (pane mode) the same set can't wake twice.
                         st.last_wake = Some(rfc3339(now));
+                        if pane {
+                            st.woken_upto = Some(newest);
+                        }
                         deliver = st.pending.clone();
                         guard = Some(g);
                         None
@@ -479,6 +600,68 @@ impl Memory {
 
         // Phase 2: wake (no watch.lock held, so other passes can record).
         let outcome = if let Some(outcome) = outcome {
+            outcome
+        } else if pane {
+            let _wake = wake_guard;
+            let upto = deliver.iter().map(|e| e.id).max().unwrap_or(0);
+            let res = main.core_pane_wake(deliver.len(), upto, now);
+            let _g = FileMutex::lock(&state_dir.join("watch.lock"))?;
+            let mut st = main.watch_state()?;
+            let (outcome, keep) = match res {
+                Ok(PaneWake::Landed(l)) => (
+                    WakeOutcome::Woken {
+                        events: deliver.len(),
+                        upto,
+                        confirmed: l == Landed::Confirmed,
+                    },
+                    true,
+                ),
+                Ok(PaneWake::Busy) => (WakeOutcome::Busy, false),
+                Ok(PaneWake::Down) => (WakeOutcome::CoreDown, false),
+                Ok(PaneWake::Failed(reason)) => (
+                    WakeOutcome::Failed {
+                        events: deliver.len(),
+                        reason,
+                    },
+                    false,
+                ),
+                Err(e) => (
+                    WakeOutcome::Failed {
+                        events: deliver.len(),
+                        reason: e.to_string(),
+                    },
+                    false,
+                ),
+            };
+            if !keep {
+                // Not delivered: un-claim, so the next pass tries again and
+                // a failed pane wake doesn't start a cooldown.
+                if st.woken_upto == Some(upto) {
+                    st.woken_upto = None;
+                }
+                if st.last_wake.as_deref() == Some(rfc3339(now).as_str()) {
+                    st.last_wake = None;
+                }
+            }
+            let msg = match &outcome {
+                WakeOutcome::Woken { confirmed, .. } => format!(
+                    "pane wake: typed into the core for {} event(s) up to #{upto}{}",
+                    deliver.len(),
+                    if *confirmed {
+                        ""
+                    } else {
+                        " (not confirmed in transcript)"
+                    }
+                ),
+                WakeOutcome::Busy => "pane wake: core busy (handoff); events stay pending".into(),
+                WakeOutcome::CoreDown => "pane wake: core is down; events stay pending".into(),
+                WakeOutcome::Failed { reason, .. } => {
+                    format!("pane wake FAILED: {reason}; events stay pending")
+                }
+                _ => String::new(),
+            };
+            main.wake_log(now, &msg)?;
+            main.save_watch_state(&st)?;
             outcome
         } else {
             let _wake = wake_guard;
@@ -527,11 +710,20 @@ impl Memory {
             outcome
         };
 
+        // Keep-warm last: never instead of a wake.
+        if started && !matches!(outcome, WakeOutcome::Woken { .. }) {
+            match main.core_keep_warm(now) {
+                Ok(r) => core_notes.extend(r.notes),
+                Err(e) => core_notes.push(format!("keep-warm error: {e}")),
+            }
+        }
+
         let pending = main.watch_state()?.pending.len();
         Ok(PassReport {
             fired,
             pending,
             wake: outcome,
+            core: core_notes,
         })
     }
 }
