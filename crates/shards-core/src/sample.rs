@@ -327,3 +327,61 @@ pub fn fake_transcript(
     std::fs::write(&path, text)?;
     Ok(path)
 }
+
+/// A FAKE reasoning core for tests. It never calls a model: it reads lines
+/// from its terminal and writes a Claude Code-shaped transcript, one
+/// prompt and one reply (with made-up token usage and a planted reply text)
+/// per line. Usage:
+///
+/// `sh fake-core.sh <projects> <ctl> [--resume <id>] [<first message>]`
+///
+/// Each start appends `args: ...` to `<ctl>/starts.log`. Files in `<ctl>`
+/// change its behaviour: `fail-all` (exit at once), `fail-fresh` (exit at
+/// once unless resuming), `ignore-exit` (`/exit` does nothing),
+/// `slow-exit` (`/exit` takes 2 s), `cold` (replies report a cache write
+/// instead of a cache read).
+pub const FAKE_CORE: &str = r#"#!/bin/sh
+projects=$1; ctl=$2; shift 2
+echo "args: $*" >> "$ctl/starts.log"
+id=""
+if [ "$1" = "--resume" ]; then id=$2; shift 2; fi
+[ -e "$ctl/fail-all" ] && exit 3
+[ -z "$id" ] && [ -e "$ctl/fail-fresh" ] && exit 4
+[ -z "$id" ] && id=$(cat /proc/sys/kernel/random/uuid)
+slug=$(printf %s "$PWD" | sed 's/[^A-Za-z0-9]/-/g')
+mkdir -p "$projects/$slug"
+tx="$projects/$slug/$id.jsonl"
+n=0
+ts() { date -u +%Y-%m-%dT%H:%M:%S.%3NZ; }
+esc() { printf %s "$1" | tr '\n\t' '  ' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+turn() {
+  n=$((n+1))
+  printf '{"type":"user","timestamp":"%s","sessionId":"%s","message":{"role":"user","content":"%s"}}\n' "$(ts)" "$id" "$(esc "$1")" >> "$tx"
+  out=40
+  case "$1" in \[[0-9][0-9]:[0-9][0-9]\]) out=1;; esac
+  read=5000; write=200
+  [ -e "$ctl/cold" ] && { read=0; write=5200; }
+  printf '{"type":"assistant","timestamp":"%s","sessionId":"%s","message":{"id":"msg-%s-%s","role":"assistant","stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":%s,"cache_read_input_tokens":%s,"cache_creation_input_tokens":%s},"content":[{"type":"text","text":"PLANTED-CORE-REPLY"}]}}\n' "$(ts)" "$id" "$$" "$n" "$out" "$read" "$write" >> "$tx"
+  echo "fake-core: replied ($n)"
+}
+[ $# -gt 0 ] && turn "$1"
+echo "fake-core: session $id ready"
+while IFS= read -r line; do
+  case "$line" in
+    /exit)
+      [ -e "$ctl/ignore-exit" ] && continue
+      [ -e "$ctl/slow-exit" ] && sleep 2
+      exit 0;;
+    "") ;;
+    *) turn "$line";;
+  esac
+done
+"#;
+
+/// Write [`FAKE_CORE`] to `dir/fake-core.sh` and return its path.
+pub fn write_fake_core(dir: &Path) -> Result<std::path::PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let p = dir.join("fake-core.sh");
+    std::fs::write(&p, FAKE_CORE)?;
+    Ok(p)
+}
