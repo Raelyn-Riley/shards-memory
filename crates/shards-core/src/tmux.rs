@@ -121,11 +121,15 @@ impl Tmux {
         .iter()
         .map(|s| s.to_string())
         .collect();
+        // Set through `env` in the pane's command: tmux's `-e` doesn't reach
+        // every variable (dash resets PS1 from it).
+        let mut line = String::from("exec env");
         for (k, v) in env {
-            args.push("-e".into());
-            args.push(format!("{k}={v}"));
+            line.push(' ');
+            line.push_str(&crate::coreadapter::shell_quote(&format!("{k}={v}")));
         }
-        args.push("/bin/sh".into());
+        line.push_str(" /bin/sh");
+        args.push(line);
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         self.run(&refs)?;
         // Keep a dead shell's pane around, so status can say so.
@@ -227,7 +231,10 @@ pub fn children(pid: u32) -> Vec<u32> {
         }
         return out;
     }
-    if let Ok(o) = Command::new("ps").args(["-A", "-o", "pid=,ppid=,stat="]).output() {
+    if let Ok(o) = Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid=,stat="])
+        .output()
+    {
         for line in String::from_utf8_lossy(&o.stdout).lines() {
             let f: Vec<&str> = line.split_whitespace().collect();
             if f.len() >= 3 && f[1].parse() == Ok(pid) && !f[2].starts_with('Z') {

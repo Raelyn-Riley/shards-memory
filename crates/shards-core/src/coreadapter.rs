@@ -212,6 +212,8 @@ impl Usage {
 /// One prompt and the core's reply to it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Turn {
+    /// This turn's prompt number in the transcript (1-based).
+    pub seq: u64,
     /// When the prompt was recorded.
     pub prompt_at: String,
     /// The prompt was exactly a `[HH:MM]` heartbeat.
@@ -259,6 +261,10 @@ pub struct TranscriptScan {
     pub last_real: Option<String>,
     /// Newest "queued while busy" record.
     pub last_queued: Option<String>,
+    /// Prompts seen so far.
+    pub prompts: u64,
+    /// "Queued while busy" records seen so far.
+    pub queued: u64,
     pub turns: Vec<Turn>,
 }
 
@@ -382,7 +388,9 @@ impl TranscriptScan {
                 if !heartbeat {
                     bump(&mut self.last_real, at);
                 }
+                self.prompts += 1;
                 self.turns.push(Turn {
+                    seq: self.prompts,
                     prompt_at: at.to_string(),
                     heartbeat,
                     ..Default::default()
@@ -395,6 +403,7 @@ impl TranscriptScan {
             Some("queue-operation") => {
                 if v.get("operation").and_then(Value::as_str) == Some("enqueue") {
                     bump(&mut self.last_queued, at);
+                    self.queued += 1;
                 }
             }
             Some("assistant") => {
@@ -421,25 +430,15 @@ impl TranscriptScan {
         }
     }
 
-    /// Did a prompt (or a queued prompt) arrive at or after `t`?
-    pub fn landed_since(&self, t: DateTime<Utc>) -> bool {
-        let t = t - chrono::Duration::seconds(1);
-        [&self.last_prompt, &self.last_queued]
-            .iter()
-            .filter_map(|s| s.as_deref().and_then(parse))
-            .any(|p| p >= t)
+    /// Has a prompt (or a queued prompt) arrived since the scan stood at
+    /// `(prompts, queued)`?
+    pub fn landed_since(&self, before: (u64, u64)) -> bool {
+        self.prompts > before.0 || self.queued > before.1
     }
 
-    /// The first finished turn whose prompt came at or after `sent`, and
-    /// after `not_before` (so one reply is never counted twice).
-    pub fn reply_after(&self, sent: DateTime<Utc>, not_before: Option<&str>) -> Option<&Turn> {
-        let sent = sent - chrono::Duration::seconds(1);
-        let floor = not_before.and_then(parse);
-        self.turns.iter().find(|t| {
-            t.done
-                && parse(&t.prompt_at)
-                    .is_some_and(|p| p >= sent && floor.is_none_or(|f| p > f))
-        })
+    /// The first finished turn whose prompt came after prompt number `after`.
+    pub fn reply_after(&self, after: u64) -> Option<&Turn> {
+        self.turns.iter().find(|t| t.done && t.seq > after)
     }
 }
 
@@ -513,11 +512,11 @@ mod tests {
         assert_eq!(s.last_entry.as_deref(), Some("2026-11-04T11:00:01.000Z"));
         let state = serde_json::to_string(&s).unwrap();
         assert!(!state.contains("PLANTED"));
-        let sent = parse("2026-11-04T10:59:59Z").unwrap();
-        assert!(s.reply_after(sent, None).unwrap().heartbeat);
-        assert!(s
-            .reply_after(sent, Some("2026-11-04T11:00:00.000Z"))
-            .is_none());
+        assert_eq!(s.prompts, 2);
+        assert_eq!(s.reply_after(0).unwrap().seq, 1);
+        assert!(s.reply_after(1).unwrap().heartbeat);
+        assert!(s.reply_after(2).is_none());
+        assert!(s.landed_since((1, 0)) && !s.landed_since((2, 0)));
         // The half-written last line is read once complete.
         let mut f = fs::OpenOptions::new().append(true).open(&p).unwrap();
         writeln!(f, r#":00.000Z","message":{{"content":"later"}}}}"#).unwrap();
