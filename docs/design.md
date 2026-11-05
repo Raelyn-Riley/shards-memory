@@ -72,9 +72,9 @@ flowchart LR
     shards["Shards<br/>branches, worktrees, agent transcripts"]
     observe["1. Observe<br/>git + activity source<br/>summaries only"]
     data["2. Data core<br/>mem board, mem watch<br/>plain code, no model"]
-    reason["3. Reasoning core<br/>an external command<br/>woken only by a trigger"]
+    reason["3. Reasoning core<br/>one long-lived session in a pane<br/>woken only by a trigger"]
     shards -- "read, never asked" --> observe --> data
-    data -- "events (deduped, cooled down)" --> reason
+    data -- "events (deduped), typed into its pane" --> reason
     reason -- "mem core context" --> data
 ```
 
@@ -94,7 +94,16 @@ Transcripts are read incrementally. Only the time and a short summary of each to
   The board also lists open conflicts and pending soul proposals. Reading it takes no lock and never blocks a writer.
 - **`mem watch`** runs the board on a timer and checks configured **triggers**: same fact, same section, a stale shard with work in flight, an open conflict, a soul proposal. Each trigger can be switched on or off in `shards.toml`. A condition fires once while it holds and can fire again after it clears and comes back. Each firing is appended to an event log.
 
-**3. Reasoning core.** This is an external command the operator chooses, such as a model session. It is run only when events are pending. It is not rate-limited by default, but an optional cooldown can cap how often it is woken, and only one wake runs at a time. It gets the pending events on stdin, and `mem core context` gives it the board plus those events in one document. A wake that fails or times out is logged, and its events wait for the next wake. Restarting the watcher doesn't re-fire anything.
+**3. Reasoning core.** This is not a one-shot call. It is one long-lived chat session in a tmux pane, so it remembers what it has reasoned about from one wake to the next.
+
+- **Started once.** `mem core start` runs the core's command in a pane on its own tmux server, with a first message: read the soul, then `mem core context`, which gives it the board and the pending events in one document. The session's id is pinned, so the core is always the same session.
+- **Woken by typing.** When events are pending, the watcher types one short line into the pane. The core reads the details itself and acknowledges when it has handled them. Until then the events stay pending, and the same pending set never wakes it twice. Reasoning isn't rate-limited by default; an optional cooldown can cap it.
+- **Open to people.** A person can attach to the pane and talk to the core directly.
+- **Kept alive.** A watchdog restores a dead pane or command and resumes the pinned session by its id, never "the most recent one". It gives up after three failures and says so. A deliberate stop stays stopped.
+- **Handing off.** A long session fills up. Before it does, the core writes a baton, and a handoff starts a fresh session in the same pane with the baton as its first message. If any step fails, the old session stays the core. What the core knows for good belongs in the memory, not in its chat; `soul/core.md` says so in plain words.
+- **Measured, not guessed.** Prompt caches expire, so a wake after a long silence may cost more. An optional keep-warm heartbeat (off by default) pings an idle core. Every wake and ping is logged with the token counts of the reply, so the two can be compared before anyone decides whether keep-warm is worth it.
+
+The agent tool sits behind an adapter, so the rest of the system doesn't assume Claude Code. The older mode, an external command run with the events on stdin, is still there for operators who want it.
 
 **Later: nudges and bulletins.** What the reasoning core decides still has to reach the shards. Two channels are planned:
 

@@ -17,9 +17,11 @@ worktree. When the session is done the shard *dinits*, and its work is merged in
 recorded for a human, never guessed. A soul change waits for a human admin. The core
 knows what every shard is doing without asking: `mem board` reads it from git and from
 each shard's agent transcript, and `mem watch` wakes a reasoning core only when a
-configured trigger fires. Built so far: facts, supersede, history, pointers, shards,
-dinit, conflicts, soul approval, locks with lease-based crash recovery, the board, the
-watcher and the wake command, and a fake-data generator. Bulletins, the drift checker
+configured trigger fires. The reasoning core is one long-lived chat session in a tmux
+pane, so it remembers what it has reasoned about. Built so far: facts, supersede,
+history, pointers, shards, dinit, conflicts, soul approval, locks with lease-based
+crash recovery, the board, the watcher, the core session (pane wakes, watchdog,
+handoff, keep-warm), and a fake-data generator. Bulletins, the drift checker
 and the web UI come later. See [`docs/design.md`](docs/design.md) for the
 design. Licensed AGPL-3.0-or-later.
 
@@ -77,6 +79,14 @@ Global: `-C, --memory <dir>` (or `SHARDS_MEMORY`) picks the memory and defaults 
 | `mem board [--json]` shows every open shard (human, state, gist, last activity, facts in flight, last few actions), then overlaps, open conflicts and soul proposals. Takes no lock. | `mem board --json` |
 | `mem watch [--once]` evaluates the triggers every `poll_secs`, records events and wakes the core. `--once` runs one pass and exits. | `mem watch --once` |
 | `mem core context` prints `mem board --json` and the pending events as one JSON document: everything a woken core needs. | `mem core context` |
+| `mem core start [--resume]` starts the core in its own tmux pane with a first message, and pins its session id. A no-op if it is running. `--resume` resumes the pinned session instead of starting a fresh one. | `mem core start` |
+| `mem core status [--json]` shows whether the pane is up and the command alive, the pinned session, the last wake, the watchdog and keep-warm. | `mem core status` |
+| `mem core attach [--print]` attaches your terminal to the core's pane, or prints the tmux command. | `mem core attach` |
+| `mem core ack [--upto N]` marks pending events up to `N` as handled. The default is the newest event the core was woken for. | `mem core ack --upto 17` |
+| `mem core check` runs one watchdog pass (restore a dead core and resume its pinned session), then keep-warm. | `mem core check` |
+| `mem core rinit --baton <file\|->` hands off to a fresh session in the same pane, whose first message carries the baton. | `mem core rinit --baton baton.md` |
+| `mem core usage [--json]` summarizes the token usage of wakes and pings by gap length, warm and cold. | `mem core usage` |
+| `mem core stop` stops the core deliberately. The watchdog leaves it stopped. | `mem core stop` |
 
 ## Shards
 
@@ -197,8 +207,8 @@ reported. Shards just keep working, and three layers watch them:
    agent's session transcript.
 2. **Data core.** `mem board` and `mem watch` are plain code. They never call a model,
    so they are always cheap to run.
-3. **Reasoning core.** An external command of your choice, run only when a configured
-   trigger fires.
+3. **Reasoning core.** One long-lived session in a tmux pane (or, in command mode, an
+   external command of your choice), woken only when a configured trigger fires.
 
 ### Observe
 
@@ -382,7 +392,16 @@ so every current condition fires once.
 
 ### Waking the core
 
-If `[wake] command` is set, a pass may wake the core. It does so when events are
+`[wake] mode` picks how a pass wakes the core:
+
+- `auto` (the default) uses `pane` once a core has been started with
+  `mem core start` and not stopped since. Otherwise it uses `command`.
+- `pane` types one short line into the core's pane. See
+  [The core session](#the-core-session).
+- `command` runs `[wake] command`, as described next. With no command set, events are
+  recorded and stay pending, and nothing runs.
+
+In command mode, if `[wake] command` is set, a pass may wake the core. It does so when events are
 pending and the last wake was at least `cooldown_secs` ago. The cooldown is 0 by
 default, so core reasoning isn't rate-limited unless you set one; dedupe still applies.
 The pass then runs the
@@ -420,6 +439,118 @@ chooses. For example (not run by anything in this repo, and never in tests):
 timeout_secs = 300
 cooldown_secs = 0
 ```
+
+### The core session
+
+The reasoning core is not a one-shot call. It is one long-lived chat session, so it
+remembers what it has reasoned about. The watcher wakes it by typing into its pane. A
+person can attach to the pane and talk to it. When it fills up, it writes down what
+matters and hands off to a fresh session.
+
+**Start.** `mem core start` creates a tmux session on the core's **own socket**
+(`[core] socket`, default `.shards/core/tmux.sock`), so nothing in your own tmux can
+touch it. The pane runs a plain shell with `SHARDS_MEMORY` set. The core's command
+(`[core] command`, default `claude`) is typed into that shell in `[core] cwd`, which
+defaults to the memory root. Its first message tells it to read `soul/` and run
+`mem core context`. The message is written to `.shards/core/first-message.md` and passed
+on the command line as `-- "$(cat <file>)"`, so only a short line is ever typed,
+however long the message is. Starting a running core does nothing.
+
+The first time Claude Code runs in a folder, it asks whether you trust it. Attach once
+(`mem core attach`) and answer, or start the core in a folder you have already trusted.
+Give the command the tool permissions the core needs, for example
+`claude --allowedTools 'Bash(mem core context)' 'Bash(mem core ack:*)'`.
+
+**The pin.** The session id is pinned in `.shards/core/session.json`. Everything that
+knows about the agent tool sits behind a `CoreAdapter` trait (`[core] adapter`):
+
+- `claude-code` (the default) finds the new session's id from the newest transcript for
+  the core's working directory (the same path rule as [Observe](#observe)), whose first
+  entry is newer than the start. It resumes with `--resume <id>` and exits with
+  `/exit`.
+- `plain` is for any program that reads lines. It has no session id and no resume.
+
+**Waking by pane.** When events are pending, a pass types one line, for example
+`[WAKE] 3 events, up to #17: run mem core context`, and the core reads everything else
+from `mem core context`. Large pastes can collapse into a placeholder in an input box,
+so the line is kept short and the text and Enter are sent as two separate tmux calls.
+Before Enter, the pass checks that the text shows in the pane. After Enter, it checks
+that a new prompt (or a queued prompt) appears in the core's transcript. A line that
+never shows is not entered, and the events wait for the next pass. A line that was
+entered but isn't seen in the transcript within `land_timeout_secs` counts as woken,
+and is reported and logged as unconfirmed. A `cooldown_secs`, if you set one, applies
+to pane wakes too.
+
+**Ack.** A pane wake doesn't take events off the pending list. The core runs
+`mem core ack --upto <n>` once it has handled them. Until then they stay pending and
+show in `mem core context`, which also gives `ack_upto`. The newest event id the core
+was woken for is kept in `watch.json`, and a pass wakes the core only if a pending
+event is newer than that. So the same pending set never wakes the core twice, and a
+new event wakes it again, once, naming all that are pending.
+
+**When a wake arrives mid-turn.** Claude Code queues a line typed while it is busy and
+takes it when the current turn ends, so the wake is read late, not lost. Nothing is
+taken off the pending list until the core acks. Further passes see that the core was
+already woken for those events and don't type again. A new event fires one new wake
+line, which queues the same way. If the core dies before it acks, the events are still
+pending. The watchdog then forgets which set the core was woken for, so the restored
+session is woken again, once.
+
+**The watchdog.** `mem core check` is one pass. Each `mem watch` pass also runs one when
+`[core] watchdog = true` (the default) and a core has been started. If the pane or its
+command is gone, the watchdog restores the pane and **resumes the pinned session by its
+explicit id** (`claude --resume <id>`). It never uses `--continue`, which picks the most
+recently touched transcript, and that can be the wrong session. A restore counts as
+working if the command is still running a moment after it starts. Every step goes to
+`.shards/core/core.log`. After three failed restores in a row, it stops trying, records
+a `core-down` event and says so in `mem core status`. `mem core start` resets it. A
+deliberate `mem core stop` is never undone: the watchdog only restores a core that is
+marked as started.
+
+**Handoff: `mem core rinit --baton <file|->`.** A long session fills up, so the core
+writes a baton and hands off. The steps run in order, and each is checked:
+
+1. Take the core lock, so that wakes, watchdog passes and pings wait.
+2. Type `/exit` and check that the pane is back at its shell.
+3. Start a fresh session in the same pane. Its first message is the usual one, followed
+   by the baton.
+4. Check that the new session's transcript appears (that is, the message was
+   delivered), and pin its id. The old id goes to `previous` in `session.json`.
+5. Release the lock. Pending events then wake the new session.
+
+If the old session won't exit, nothing else happens and it keeps running. If the new
+session doesn't come up or can't be pinned, it is killed, the old session is resumed by
+its id, and the error says so. Wakes that arrive during a handoff find the core lock
+taken, so they type nothing, and the events stay pending. `mem init` writes
+`soul/core.md`, which explains in plain words what the core is. It reads the board,
+reasons, tells people, writes decisions to main and writes a baton before it hands off.
+The core's lasting knowledge belongs in the memory, not in its chat.
+
+**Keep-warm (off by default, for measuring).** Prompt caches expire, so a wake after a
+long silence may cost more than one soon after. With `[core] keep_warm = true`, a pass
+types `[HH:MM]` into the pane when the core's last transcript **entry** is older than
+`keep_warm_mins` (default 50). It uses the timestamp inside the transcript, not the
+file's mtime, which bookkeeping writes can move. `soul/core.md` tells the core that a
+message that is exactly `[HH:MM]` is a heartbeat: reply with one character and do
+nothing else. After `keep_warm_quiet_limit` pings (default 8) with no real activity,
+the pings stop. They resume after the next real activity, meaning a prompt that isn't
+a heartbeat, such as a wake or a person typing.
+
+**Usage.** Every ping and every wake goes to `.shards/core/usage.jsonl` with:
+
+- the time and the kind,
+- the gap since the previous entry and the idle time since the core's last transcript
+  entry,
+- the token usage of the core's reply, read from the transcript: input, output, cache
+  read and cache creation, summed over the reply's model calls, and the same counts for
+  its first call.
+
+A reply counts as **warm** when its first call read more from the cache than it wrote.
+`mem core usage` prints, for wakes and pings, the average cost by gap length, split
+into warm and cold. It records numbers only, under the same privacy rule as the board.
+The core's transcript is read for times, prompt counts and token counts, and no prompt
+or reply text is stored or printed. A prompt is checked for one thing only, whether it
+is exactly `[HH:MM]`.
 
 ## Config: `shards.toml`
 
@@ -459,15 +590,31 @@ open_conflict = true
 soul_proposal = true
 
 [wake]
-command = ""            # empty: record events, run nothing
+mode = "auto"           # "auto": pane once mem core start has run, else command | "command" | "pane"
+command = ""            # command mode: empty records events and runs nothing
 timeout_secs = 300
 cooldown_secs = 0       # wake the core at most once per this long; 0: no limit
+
+[core]
+command = "claude"      # typed into the core's pane by mem core start
+adapter = "claude-code" # "claude-code": session ids, --resume <id> | "plain"
+socket = ".shards/core/tmux.sock"  # the core's own tmux server
+session = "core"
+cwd = ""                # empty: the memory root
+watchdog = true         # mem watch restores a dead core and resumes its pinned session
+start_timeout_secs = 60 # a start, resume or handoff must come up (and pin) in this long
+exit_timeout_secs = 30  # the core must exit this soon after /exit
+land_timeout_secs = 10  # a typed line must show in the pane / transcript this soon
+keep_warm = false       # ping an idle core with [HH:MM] (for measuring)
+keep_warm_mins = 50
+keep_warm_quiet_limit = 8
 ```
 
 Local state that is never committed lives in `.shards/`: `worktrees/`, `shards/`
 (shard records), `status/`, `locks/`, `lock.log`, `activity/` (per-shard activity
-summaries and transcript offsets), `events.jsonl`, `watch.json` (watcher state) and
-`wake.log`.
+summaries and transcript offsets), `events.jsonl`, `watch.json` (watcher state),
+`wake.log` and `core/` (`session.json`, `state.json`, `core.log`, `usage.jsonl`,
+`first-message.md`, `core.lock` and the tmux socket).
 
 Address rules: at least `section/name`. Segments use only `a-z 0-9 - _ .`, start with a
 letter or digit, and carry no `facts/` prefix or `.md` suffix. Lowercase only, so two
