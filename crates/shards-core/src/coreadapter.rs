@@ -93,9 +93,11 @@ impl CoreAdapter for ClaudeCodeCore {
     fn launch_line(&self, command: &str, launch: &Launch) -> String {
         match launch {
             // The message is read from the file by the shell, so only this
-            // short line is typed, however long the message is.
+            // short line is typed, however long the message is. `--` ends
+            // the options, so a variadic flag in `command` (such as
+            // `--allowedTools a b`) can't swallow the message.
             Launch::Fresh { first_message } => format!(
-                "{command} \"$(cat {})\"",
+                "{command} -- \"$(cat {})\"",
                 shell_quote(&first_message.to_string_lossy())
             ),
             // Always the explicit id: `--continue` picks the most recently
@@ -474,7 +476,7 @@ mod tests {
                 first_message: Path::new("/m/.shards/core/first.md"),
             },
         );
-        assert_eq!(l, "claude \"$(cat '/m/.shards/core/first.md')\"");
+        assert_eq!(l, "claude -- \"$(cat '/m/.shards/core/first.md')\"");
         assert!(!l.contains("--continue"));
     }
 

@@ -333,7 +333,7 @@ pub fn fake_transcript(
 /// prompt and one reply (with made-up token usage and a planted reply text)
 /// per line. Usage:
 ///
-/// `sh fake-core.sh <projects> <ctl> [--resume <id>] [<first message>]`
+/// `sh fake-core.sh <projects> <ctl> [--resume <id>] [-- <first message>]`
 ///
 /// Each start appends `args: ...` to `<ctl>/starts.log`. Files in `<ctl>`
 /// change its behaviour: `fail-all` (exit at once), `fail-fresh` (exit at
@@ -345,6 +345,7 @@ projects=$1; ctl=$2; shift 2
 echo "args: $*" >> "$ctl/starts.log"
 id=""
 if [ "$1" = "--resume" ]; then id=$2; shift 2; fi
+[ "$1" = "--" ] && shift
 [ -e "$ctl/fail-all" ] && exit 3
 [ -z "$id" ] && [ -e "$ctl/fail-fresh" ] && exit 4
 [ -z "$id" ] && id=$(cat /proc/sys/kernel/random/uuid)
