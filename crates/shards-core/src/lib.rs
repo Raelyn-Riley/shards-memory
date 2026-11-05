@@ -14,6 +14,7 @@ pub mod activity;
 pub mod address;
 pub mod board;
 pub mod config;
+pub mod coreadapter;
 pub mod error;
 pub mod fact;
 pub mod git;
@@ -22,6 +23,7 @@ pub mod memory;
 pub mod pointer;
 pub mod sample;
 pub mod shard;
+pub mod tmux;
 pub mod watch;
 
 pub use address::Address;

@@ -85,6 +85,9 @@ pub enum Error {
     )]
     LockLost(String),
 
+    #[error("core: {0}")]
+    Core(String),
+
     #[error("bad shards.toml: {0}")]
     Config(String),
 
