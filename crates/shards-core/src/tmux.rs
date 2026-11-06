@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Raelyn Rose
 
-//! A small wrapper around `tmux` for the core's pane.
+//! A small wrapper around `tmux` for the panes of the core and the shards.
 //!
-//! The core gets its **own tmux server** (`tmux -S <socket>`), so nothing the
-//! operator does in their own tmux can touch it and `kill-server` only ever
-//! kills the core. The server is started with `-f /dev/null`, so a personal
-//! `~/.tmux.conf` can't change how the pane behaves.
+//! The core gets its **own tmux server** (`tmux -S <socket>`), and the shards
+//! share one more, so nothing the operator does in their own tmux can touch
+//! them and `kill-server` only ever kills that server. Each shard is its own
+//! tmux session (one window) on the shards server. A server is started with
+//! `-f /dev/null`, so a personal `~/.tmux.conf` can't change how a pane
+//! behaves.
 //!
-//! The pane runs a plain `/bin/sh`. The core's command is *typed into that
+//! The pane runs a plain `/bin/sh`. The agent's command is *typed into that
 //! shell*, so when the command exits the pane is still there, back at the
 //! shell. That is what lets a handoff check that the old session really
 //! exited before it starts the new one in the same pane.
@@ -188,7 +190,13 @@ impl Tmux {
         }
     }
 
-    /// Kill the core's tmux server (its own socket, so only the core).
+    /// Kill this session only. The server exits by itself once it has no
+    /// sessions left.
+    pub fn kill_session(&self) {
+        let _ = self.output(&["kill-session", "-t", &self.target()]);
+    }
+
+    /// Kill the whole tmux server on this socket (every session on it).
     pub fn kill_server(&self) {
         let _ = self.output(&["kill-server"]);
         let _ = std::fs::remove_file(&self.socket);

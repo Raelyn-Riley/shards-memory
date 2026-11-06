@@ -18,6 +18,10 @@
 //! [shards]
 //! keep_branches = true   # keep shard/<id> after a clean dinit
 //! worktree_dir = ".shards/worktrees"  # relative to the memory root, or absolute
+//! command = "claude"     # each shard's session, run in its own tmux pane
+//! adapter = "claude-code" # "claude-code" | "plain"
+//! socket = ".shards/sessions/tmux.sock"
+//! claude_config = ""     # default: $CLAUDE_CONFIG_DIR/.claude.json or ~/.claude.json
 //!
 //! [activity]
 //! source = "claude-code" # "claude-code" | "none"
@@ -123,6 +127,15 @@ pub struct SoulConfig {
 pub struct ShardsConfig {
     pub keep_branches: bool,
     pub worktree_dir: String,
+    /// The command line `mem shard start` types into a shard's pane.
+    pub command: String,
+    pub adapter: AdapterKind,
+    /// The shards' one tmux server: relative to the memory root, or absolute.
+    pub socket: String,
+    /// Claude Code's config file, read (never written) to check that the
+    /// memory root is trusted. Empty: `$CLAUDE_CONFIG_DIR/.claude.json` or
+    /// `~/.claude.json`.
+    pub claude_config: String,
 }
 
 impl Default for ShardsConfig {
@@ -130,6 +143,10 @@ impl Default for ShardsConfig {
         ShardsConfig {
             keep_branches: true,
             worktree_dir: ".shards/worktrees".to_string(),
+            command: "claude".to_string(),
+            adapter: AdapterKind::ClaudeCode,
+            socket: ".shards/sessions/tmux.sock".to_string(),
+            claude_config: String::new(),
         }
     }
 }
@@ -387,6 +404,10 @@ admins = []            # humans allowed to approve soul changes, e.g. ["Ada"]
 [shards]
 keep_branches = true   # keep shard/<id> after a clean dinit (history); false deletes it
 worktree_dir = ".shards/worktrees"
+command = "claude"     # typed into each shard's pane by `mem shard start`
+adapter = "claude-code" # "claude-code": pinned --session-id, --resume <id> | "plain"
+socket = ".shards/sessions/tmux.sock"  # the shards' one tmux server
+claude_config = ""     # empty: ~/.claude.json (read to check the memory root is trusted)
 
 [activity]
 source = "claude-code" # "claude-code" (read session transcripts) | "none" (git only)

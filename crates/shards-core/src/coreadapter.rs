@@ -32,6 +32,21 @@ pub enum Launch<'a> {
     Fresh { first_message: &'a Path },
     /// Resume the pinned session by its explicit id.
     Resume { id: &'a str },
+    /// A new session with no first message, under an id chosen up front
+    /// (see [`CoreAdapter::new_session_id`]), so it is pinned before it has
+    /// written anything.
+    Blank { id: Option<&'a str> },
+}
+
+/// What the agent's screen in a pane says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Screen {
+    /// Waiting for a message.
+    Ready,
+    /// Waiting for someone to answer a question first (the reason).
+    Blocked(String),
+    /// Can't tell from the screen.
+    Unknown,
 }
 
 /// Single-quote for `sh`.
@@ -57,12 +72,63 @@ pub trait CoreAdapter {
     fn find_session(&self, cwd: &Path, since: DateTime<Utc>, not: Option<&str>) -> Option<String>;
     /// The transcript of session `id` in `cwd`.
     fn transcript(&self, cwd: &Path, id: &str) -> Option<PathBuf>;
+    /// An id for a session about to be started with [`Launch::Blank`], if
+    /// the tool lets the caller choose it.
+    fn new_session_id(&self) -> Option<String> {
+        None
+    }
+    /// Read the pane's screen.
+    fn screen(&self, _text: &str) -> Screen {
+        Screen::Unknown
+    }
+    /// Will the tool run in a git worktree of `root` without asking whether
+    /// to trust the folder? `None`: can't tell.
+    fn workspace_trusted(&self, _root: &Path) -> Option<bool> {
+        None
+    }
 }
 
 /// Claude Code: one JSONL transcript per session under
 /// `<projects>/<slug of cwd>/<session-id>.jsonl` (see [`crate::activity`]).
 pub struct ClaudeCodeCore {
     pub projects: ClaudeCode,
+    /// Claude Code's own config file (`~/.claude.json`), read for folder
+    /// trust only. `None`: not known.
+    pub config_file: Option<PathBuf>,
+}
+
+/// Claude Code's config file: `$CLAUDE_CONFIG_DIR/.claude.json`, else
+/// `~/.claude.json`.
+pub fn claude_config_file() -> Option<PathBuf> {
+    match std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) {
+        Some(d) => Some(PathBuf::from(d).join(".claude.json")),
+        None => std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude.json")),
+    }
+}
+
+/// A random (version 4) UUID.
+pub fn uuid_v4() -> String {
+    let mut b = [0u8; 16];
+    let ok = File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b))
+        .is_ok();
+    if !ok {
+        // No /dev/urandom: time and pid are unique enough for a session id.
+        let t = Utc::now().timestamp_nanos_opt().unwrap_or_default() as u128;
+        let x = t ^ ((std::process::id() as u128) << 64);
+        b = x.to_le_bytes();
+    }
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    )
 }
 
 /// The time of the first timestamped record in a JSONL file.
@@ -103,6 +169,10 @@ impl CoreAdapter for ClaudeCodeCore {
             // Always the explicit id: `--continue` picks the most recently
             // touched transcript, which can be the wrong session.
             Launch::Resume { id } => format!("{command} --resume {}", shell_quote(id)),
+            Launch::Blank { id: Some(id) } => {
+                format!("{command} --session-id {}", shell_quote(id))
+            }
+            Launch::Blank { id: None } => command.to_string(),
         }
     }
 
@@ -147,6 +217,40 @@ impl CoreAdapter for ClaudeCodeCore {
             .map(|d| d.join(format!("{id}.jsonl")))
             .find(|p| p.is_file())
     }
+
+    fn new_session_id(&self) -> Option<String> {
+        Some(uuid_v4())
+    }
+
+    fn screen(&self, text: &str) -> Screen {
+        if text.contains("Accessing workspace") || text.contains("trust this folder") {
+            return Screen::Blocked(
+                "Claude Code is asking whether to trust this folder".to_string(),
+            );
+        }
+        if text.lines().any(|l| l.trim_start().starts_with('❯')) {
+            return Screen::Ready;
+        }
+        Screen::Unknown
+    }
+
+    /// Claude Code keeps one config entry per *canonical* git root: a
+    /// worktree's entry is its main checkout's. So a shard's worktree is
+    /// trusted exactly when the memory root is (checked in Claude Code
+    /// 2.1.319). This only reads the file; it never writes it.
+    fn workspace_trusted(&self, root: &Path) -> Option<bool> {
+        let text = fs::read_to_string(self.config_file.as_ref()?).ok()?;
+        let v: Value = serde_json::from_str(&text).ok()?;
+        let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let key = root.to_string_lossy();
+        Some(
+            v.pointer("/projects")
+                .and_then(|p| p.get(key.as_ref()))
+                .and_then(|p| p.get("hasTrustDialogAccepted"))
+                .and_then(Value::as_bool)
+                == Some(true),
+        )
+    }
 }
 
 /// Any program that reads lines: no session ids, nothing to resume.
@@ -173,11 +277,15 @@ impl CoreAdapter for PlainCore {
     }
 }
 
-/// The configured adapter.
-pub fn adapter_for(cfg: &Config, root: &Path) -> Box<dyn CoreAdapter> {
-    match cfg.core.adapter {
+/// The adapter of `kind` (`[core] adapter` or `[shards] adapter`).
+pub fn adapter_for(kind: AdapterKind, cfg: &Config, root: &Path) -> Box<dyn CoreAdapter> {
+    match kind {
         AdapterKind::ClaudeCode => Box::new(ClaudeCodeCore {
             projects: ClaudeCode::from_config(&cfg.activity, root),
+            config_file: match cfg.shards.claude_config.trim() {
+                "" => claude_config_file(),
+                p => Some(PathBuf::from(p)),
+            },
         }),
         AdapterKind::Plain => Box::new(PlainCore),
     }
@@ -465,6 +573,7 @@ mod tests {
             projects: ClaudeCode {
                 projects: PathBuf::from("/nowhere"),
             },
+            config_file: None,
         };
         assert_eq!(
             c.launch_line("claude --model haiku", &Launch::Resume { id: "abc" }),
@@ -478,6 +587,44 @@ mod tests {
         );
         assert_eq!(l, "claude -- \"$(cat '/m/.shards/core/first.md')\"");
         assert!(!l.contains("--continue"));
+        assert_eq!(
+            c.launch_line("claude", &Launch::Blank { id: Some("u-1") }),
+            "claude --session-id 'u-1'"
+        );
+    }
+
+    #[test]
+    fn uuids_are_v4() {
+        let a = uuid_v4();
+        assert_eq!(a.len(), 36);
+        assert_eq!(&a[14..15], "4");
+        assert!("89ab".contains(&a[19..20]));
+        assert_ne!(a, uuid_v4());
+    }
+
+    #[test]
+    fn screens_and_trust() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("claude.json");
+        let root = dir.path().join("m");
+        fs::create_dir(&root).unwrap();
+        let c = ClaudeCodeCore {
+            projects: ClaudeCode {
+                projects: dir.path().join("p"),
+            },
+            config_file: Some(cfg.clone()),
+        };
+        let trust = " Accessing workspace:\n /m\n ❯ No, exit\n   Yes, I trust this folder\n";
+        assert!(matches!(c.screen(trust), Screen::Blocked(_)));
+        assert_eq!(c.screen("──────\n❯ \n──────\n"), Screen::Ready);
+        assert_eq!(c.screen("starting…"), Screen::Unknown);
+        assert_eq!(c.workspace_trusted(&root), None);
+        let real = fs::canonicalize(&root).unwrap();
+        fs::write(&cfg, r#"{"projects":{}}"#).unwrap();
+        assert_eq!(c.workspace_trusted(&root), Some(false));
+        let v = serde_json::json!({"projects": {real.to_string_lossy(): {"hasTrustDialogAccepted": true}}});
+        fs::write(&cfg, v.to_string()).unwrap();
+        assert_eq!(c.workspace_trusted(&root), Some(true));
     }
 
     #[test]

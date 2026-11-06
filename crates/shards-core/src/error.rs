@@ -88,6 +88,9 @@ pub enum Error {
     #[error("core: {0}")]
     Core(String),
 
+    #[error("shard session: {0}")]
+    Session(String),
+
     #[error("bad shards.toml: {0}")]
     Config(String),
 

@@ -21,6 +21,7 @@ pub mod fact;
 pub mod git;
 pub mod lock;
 pub mod memory;
+pub mod pane;
 pub mod pointer;
 pub mod sample;
 pub mod shard;

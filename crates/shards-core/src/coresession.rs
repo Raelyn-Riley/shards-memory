@@ -37,6 +37,7 @@ use crate::coreadapter::{adapter_for, parse, CoreAdapter, Launch, TranscriptScan
 use crate::error::{Error, Result};
 use crate::lock::FileMutex;
 use crate::memory::Memory;
+use crate::pane::PaneRunner;
 use crate::tmux::{self, Tmux};
 
 /// Consecutive failed restores after which the watchdog stops trying.
@@ -316,7 +317,7 @@ struct Core {
     root: PathBuf,
     dir: PathBuf,
     cwd: PathBuf,
-    tmux: Tmux,
+    pane: PaneRunner,
     adapter: Box<dyn CoreAdapter>,
     cfg: crate::config::CoreConfig,
 }
@@ -382,96 +383,11 @@ impl Core {
 
     /// (pane up, command alive).
     fn alive(&self) -> (bool, bool) {
-        match self.tmux.pane() {
-            Some(p) if !p.dead => (true, !tmux::children(p.pid).is_empty()),
-            Some(_) => (false, false),
-            None => (false, false),
-        }
+        self.pane.alive()
     }
 
-    /// A pane with a live shell, creating it if needed.
-    fn ensure_pane(&self) -> Result<()> {
-        match self.tmux.pane() {
-            Some(p) if !p.dead => return Ok(()),
-            Some(_) => self.tmux.kill_server(),
-            None => {}
-        }
-        let env = vec![
-            (
-                "SHARDS_MEMORY".to_string(),
-                self.root.to_string_lossy().into_owned(),
-            ),
-            ("PS1".to_string(), PS1.to_string()),
-            ("ENV".to_string(), String::new()),
-        ];
-        self.tmux.new_session(&self.cwd, &env)?;
-        if !self.tmux.wait_for_text(PS1, Duration::from_secs(5)) {
-            return Err(Error::Core("the pane's shell did not come up".into()));
-        }
-        Ok(())
-    }
-
-    /// Wait until the pane's command is running and still running a moment
-    /// later.
-    fn wait_alive(&self, timeout: Duration) -> bool {
-        let start = Instant::now();
-        let settle = Duration::from_millis(700);
-        loop {
-            if self.alive().1 {
-                std::thread::sleep(settle);
-                if self.alive().1 {
-                    return true;
-                }
-            }
-            if start.elapsed() >= timeout {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    /// Wait until the command has exited and the pane is back at its shell.
-    fn wait_exited(&self, timeout: Duration) -> bool {
-        let start = Instant::now();
-        loop {
-            let (up, alive) = self.alive();
-            if up && !alive {
-                return true;
-            }
-            if start.elapsed() >= timeout {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    /// Type `text`, check it shows in the pane (so it wasn't collapsed into
-    /// a paste placeholder), then press Enter as a separate call.
     fn type_line(&self, text: &str) -> Result<()> {
-        let before = self
-            .tmux
-            .capture()
-            .map(|c| c.matches(text).count())
-            .unwrap_or(0);
-        self.tmux.type_text(text)?;
-        let start = Instant::now();
-        loop {
-            let now = self
-                .tmux
-                .capture()
-                .map(|c| c.matches(text).count())
-                .unwrap_or(0);
-            if now > before {
-                break;
-            }
-            if start.elapsed() >= self.cfg.land_timeout() {
-                return Err(Error::Core(
-                    "the typed line did not show in the pane; Enter not pressed".into(),
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        self.tmux.enter()
+        self.pane.type_line(text)
     }
 
     /// Type a line to the running core and confirm it reached the session.
@@ -517,7 +433,7 @@ impl Core {
             },
         );
         self.type_line(&line)?;
-        if !self.wait_alive(self.cfg.start_timeout()) {
+        if !self.pane.wait_alive(self.cfg.start_timeout()) {
             return Err(Error::Core(
                 "the core's command did not start (or exited)".into(),
             ));
@@ -556,7 +472,7 @@ impl Core {
             .adapter
             .launch_line(&self.cfg.command, &Launch::Resume { id });
         self.type_line(&line)?;
-        if !self.wait_alive(self.cfg.start_timeout()) {
+        if !self.pane.wait_alive(self.cfg.start_timeout()) {
             return Err(Error::Core(format!(
                 "resuming session {id}: the command did not start (or exited)"
             )));
@@ -567,26 +483,7 @@ impl Core {
     /// Tell the running command to exit; true once the pane is back at its
     /// shell.
     fn exit_command(&self) -> bool {
-        if !self.alive().1 {
-            return true;
-        }
-        if self.type_line(self.adapter.exit_text()).is_err() {
-            return false;
-        }
-        self.wait_exited(self.cfg.exit_timeout())
-    }
-
-    /// Kill whatever the pane's shell is running (last resort, during a
-    /// failed handoff).
-    fn kill_command(&self) {
-        if let Some(p) = self.tmux.pane() {
-            for c in tmux::children(p.pid) {
-                let _ = std::process::Command::new("kill")
-                    .args(["-TERM", &c.to_string()])
-                    .status();
-            }
-        }
-        self.wait_exited(Duration::from_secs(3));
+        self.pane.exit_command(self.adapter.exit_text())
     }
 
     /// Read new transcript lines and write usage entries for replies found.
@@ -708,10 +605,26 @@ impl Memory {
         } else {
             abs(cfg.core.cwd.trim())
         };
+        let pane = PaneRunner {
+            tmux: Tmux::new(abs(&cfg.core.socket), cfg.core.session.clone()),
+            cwd: cwd.clone(),
+            env: vec![
+                (
+                    "SHARDS_MEMORY".to_string(),
+                    root.to_string_lossy().into_owned(),
+                ),
+                ("PS1".to_string(), PS1.to_string()),
+                ("ENV".to_string(), String::new()),
+            ],
+            ps1: PS1.to_string(),
+            start_timeout: cfg.core.start_timeout(),
+            exit_timeout: cfg.core.exit_timeout(),
+            land_timeout: cfg.core.land_timeout(),
+        };
         Ok(Core {
             dir: main.state_dir().join("core"),
-            tmux: Tmux::new(abs(&cfg.core.socket), cfg.core.session.clone()),
-            adapter: adapter_for(&cfg, &root),
+            pane,
+            adapter: adapter_for(cfg.core.adapter, &cfg, &root),
             cwd,
             root,
             cfg: cfg.core,
@@ -742,7 +655,7 @@ impl Memory {
                 session_id: c.pin().session_id,
             });
         }
-        c.ensure_pane()?;
+        c.pane.ensure_pane()?;
         let old = c.pin();
         let now = Utc::now();
         let (id, resumed) = match old.session_id.as_deref().filter(|_| resume) {
@@ -800,32 +713,32 @@ impl Memory {
         let c = self.core()?;
         let _g = c.lock()?;
         let mut st = c.state();
-        let was = st.started || c.tmux.has_session();
+        let was = st.started || c.pane.tmux.has_session();
         st.started = false;
         st.stopped_at = Some(rfc3339(Utc::now()));
         c.save_state(&st)?;
-        if c.tmux.has_session() {
+        if c.pane.tmux.has_session() {
             if !c.exit_command() {
                 c.log("stop: the command did not exit when told; killing the pane");
             }
-            c.tmux.kill_server();
+            c.pane.tmux.kill_server();
         }
         c.log("stop: deliberate; the watchdog will leave it stopped");
         Ok(was)
     }
 
     pub fn core_attach_command(&self) -> Result<Vec<String>> {
-        Ok(self.core()?.tmux.attach_command())
+        Ok(self.core()?.pane.tmux.attach_command())
     }
 
     /// Attach this terminal to the core's pane (detach with the tmux prefix
     /// then `d`; the core keeps running).
     pub fn core_attach(&self) -> Result<()> {
         let c = self.core()?;
-        if !c.tmux.has_session() {
+        if !c.pane.tmux.has_session() {
             return Err(Error::Core("the core isn't running; mem core start".into()));
         }
-        let cmd = c.tmux.attach_command();
+        let cmd = c.pane.tmux.attach_command();
         let status = std::process::Command::new(&cmd[0])
             .args(&cmd[1..])
             .env_remove("TMUX")
@@ -880,7 +793,7 @@ impl Memory {
                 quiet_limit: c.cfg.keep_warm_quiet_limit,
                 last_ping: st.last_ping.clone(),
             },
-            attach: c.tmux.attach_command().join(" "),
+            attach: c.pane.tmux.attach_command().join(" "),
         })
     }
 
@@ -919,6 +832,7 @@ impl Memory {
             if up { "command" } else { "pane" }
         ));
         let res = c
+            .pane
             .ensure_pane()
             .and_then(|_| match pin.session_id.as_deref() {
                 Some(id) => c.launch_resume(id).map(|_| Some(id.to_string())),
@@ -1155,7 +1069,7 @@ impl Memory {
             }
             Err(e) => {
                 c.log(&format!("rinit: FAILED starting the new session: {e}"));
-                c.kill_command();
+                c.pane.kill_command();
                 let back = match old.as_deref() {
                     Some(id) => c.launch_resume(id),
                     None => c.launch_fresh(None, None).map(|_| ()),
