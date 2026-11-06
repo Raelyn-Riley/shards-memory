@@ -6,7 +6,7 @@ Design of record · November 2026 · Raelyn Rose
 
 A shards system is one agent with one shared memory, met through many sessions. The core owns **main**, the single true memory. When someone starts working, the core sends them a **shard**: a separate session with the same soul, working on its own branch of main.
 
-- **One shard per session.** A person talks to the same shard for the whole session, so nothing they build together is lost mid-work.
+- **A shard is a session in a pane.** A shard is a whole agent session in its own tmux pane, the same shape as the core, not a sub-agent. A person talks to the same shard for the whole session, so nothing they build together is lost mid-work. Its pane stays up until the person says they're done; nothing closes it for being idle or stale.
 - **One soul, not one per person.** There is never "Alice's agent" or "Bob's agent." Every shard is born from the same soul files in main.
 - **Code-switching, not separate selves.** Main keeps one profile per person (tastes, how they like answers, what they're working on). A shard reads the soul, then the profile of whoever it's talking to.
 - **Dinit merges back.** When the person is done, the shard dinits: it hands its branch to the core, which merges it into main and checks nothing conflicts.
@@ -14,9 +14,9 @@ A shards system is one agent with one shared memory, met through many sessions. 
 ```mermaid
 flowchart TB
     core["Core (main)<br/>one soul, person profiles, every fact<br/>merges one dinit at a time, under the lock"]
-    s1["Shard<br/>own branch of main<br/>one session, one person"]
-    s2["Shard<br/>own branch of main<br/>one session, one person"]
-    s3["Shard<br/>own branch of main<br/>one session, one person"]
+    s1["Shard<br/>a session in its own pane<br/>own branch of main, one person"]
+    s2["Shard<br/>a session in its own pane<br/>own branch of main, one person"]
+    s3["Shard<br/>a session in its own pane<br/>own branch of main, one person"]
     s1 -- "observed, dinit" --> core
     s2 -- "observed, dinit" --> core
     s3 -- "observed, dinit" --> core
@@ -40,6 +40,20 @@ The memory is a git repository of markdown files. Every fact is one file at one 
 | Provenance | Every commit names the shard (session) and the human at the keyboard. |
 
 All reads and writes go through one small tool, `mem`, so every agent uses the same door.
+
+## Shards: a session in its own pane
+
+A shard is one long-lived agent session, run like the core: a pane on a tmux server of the system's own, with the session id pinned so it is always the same session.
+
+- **Started.** `mem shard start` opens the shard (its branch and worktree), then starts the agent in a pane whose shell sits in the worktree. All shards share one shards tmux server. Each is its own tmux session there, so two people can attach to two shards at once.
+- **Pinned before it speaks.** The id is chosen up front (`--session-id`) and recorded with the shard, because a blank session writes no transcript until its first message.
+- **Blank, for now.** A shard starts with no soul, profile or first message. Inits and dinits come next; the start has one place where they plug in.
+- **Up until done.** Nothing closes a shard's pane for being idle or stale. `mem shard stop` ends the session cleanly and keeps the branch, worktree and pin; `--resume` brings the pinned session back by its id. A clean dinit stops the session before it closes the shard.
+- **Unattended.** Claude Code asks whether to trust a new folder, but it keeps that answer per canonical git root. A shard's worktree is a worktree of the memory, so trusting the memory root once covers every shard. `mem` checks this (read only) before it opens anything, and a trust question on screen fails the start at once rather than leaving a pane waiting.
+- **Survives its launcher.** The tmux server starts in its own systemd scope, so restarting whatever ran `mem` (a web UI's service) doesn't kill the panes.
+- **Talked to through its own transcript.** `mem shard send` types into one shard's pane and confirms the message in that shard's transcript, found by its pinned id. A chat UI reads each shard's transcript by that id, never by looking for the text it sent, so the same words sent to two shards can't cross.
+
+An idle pane costs about 255–275 MiB of RAM (Claude Code 2.1.319).
 
 ## Merging and locks: only the merge into main is locked
 
@@ -103,7 +117,7 @@ Transcripts are read incrementally. Only the time and a short summary of each to
 - **Handing off.** A long session fills up. Before it does, the core writes a baton, and a handoff starts a fresh session in the same pane with the baton as its first message. If any step fails, the old session stays the core. What the core knows for good belongs in the memory, not in its chat; `soul/core.md` says so in plain words.
 - **Measured, not guessed.** Prompt caches expire, so a wake after a long silence may cost more. An optional keep-warm heartbeat (off by default) pings an idle core. Every wake and ping is logged with the token counts of the reply, so the two can be compared before anyone decides whether keep-warm is worth it.
 
-The agent tool sits behind an adapter, so the rest of the system doesn't assume Claude Code. The older mode, an external command run with the events on stdin, is still there for operators who want it.
+The agent tool sits behind an adapter, shared by the core and the shards, so the rest of the system doesn't assume Claude Code. The older mode, an external command run with the events on stdin, is still there for operators who want it.
 
 **Later: nudges and bulletins.** What the reasoning core decides still has to reach the shards. Two channels are planned:
 

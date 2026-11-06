@@ -11,18 +11,20 @@ reason. Old values stay readable through history, and nothing in the tool can re
 that history.
 
 All reads and writes go through one small tool, `mem`, which is a thin CLI over the
-`shards-core` library. Each session works in a *shard*: its own branch and git
-worktree. When the session is done the shard *dinits*, and its work is merged into
+`shards-core` library. Each session works in a *shard*: a whole agent session running
+in its own tmux pane, on its own branch and git worktree. When the person is done the
+shard *dinits*, and its work is merged into
 `main` under a lock. If a shard and main both changed the same fact, the conflict is
 recorded for a human, never guessed. A soul change waits for a human admin. The core
 knows what every shard is doing without asking: `mem board` reads it from git and from
 each shard's agent transcript, and `mem watch` wakes a reasoning core only when a
 configured trigger fires. The reasoning core is one long-lived chat session in a tmux
 pane, so it remembers what it has reasoned about. Built so far: facts, supersede,
-history, pointers, shards, dinit, conflicts, soul approval, locks with lease-based
-crash recovery, the board, the watcher, the core session (pane wakes, watchdog,
-handoff, keep-warm), and a fake-data generator. Bulletins, the drift checker
-and the web UI come later. See [`docs/design.md`](docs/design.md) for the
+history, pointers, shards (each a session in its own pane), dinit, conflicts, soul
+approval, locks with lease-based crash recovery, the board, the watcher, the core
+session (pane wakes, watchdog, handoff, keep-warm), and a fake-data generator. Shard
+inits and dinits (soul, profile, first message), bulletins, the drift checker and the
+web UI come later. See [`docs/design.md`](docs/design.md) for the
 design. Licensed AGPL-3.0-or-later.
 
 ## Build
@@ -71,12 +73,17 @@ Global: `-C, --memory <dir>` (or `SHARDS_MEMORY`) picks the memory and defaults 
 | `mem gen-sample <dir> --seed N` builds a fake flock: 3 birds, 30 facts in 4 sections, 3 supersedes, 3 notes with pointers. The same seed gives byte-identical commits. | `mem gen-sample /tmp/flock --seed 7` |
 | `mem put <path> [file\|-] --why ...` writes a `notes/`, `people/` or `soul/` markdown file as one commit. Writing `soul/` on main needs an admin `--human`. | `mem put people/ada.md profile.md --why "prefers short answers"` |
 | `mem shard open --id <id> [--human <name>]` creates branch `shard/<id>` from main in its own worktree and prints the worktree path. | `cd "$(mem shard open --id s7 --human Ada)"` |
-| `mem shard list` lists open shards: human, base commit, last commit time and status line. | `mem shard list` |
+| `mem shard start [--id <id>] --human <name>` opens a shard (as `shard open` does) and starts its session in its own pane, pinned to a session id. Blank for now: no first message. The id defaults to the first free `s<n>`. | `mem shard start --human Ada` |
+| `mem shard start --id <id> --resume` brings a stopped shard's pinned session back by its id. A no-op if it is running. | `mem shard start --id s7 --resume` |
+| `mem shard stop --id <id>` ends the session cleanly (`/exit`) and closes its pane. Branch, worktree and pin stay. | `mem shard stop --id s7` |
+| `mem shard attach --id <id> [--print]` attaches your terminal to the shard's pane, or prints the tmux command. | `mem shard attach --id s7` |
+| `mem shard send --id <id> <text\|->` types one message into the shard's pane and confirms it in that session's transcript. | `mem shard send --id s7 "hello"` |
+| `mem shard list [--json]` lists open shards: human, pane (`up`, `shell`, `down`), pinned session, base commit, last commit time and status line. | `mem shard list` |
 | `mem shard status --id <id> "<gist>"` sets the shard's one-line status. | `mem shard status --id s7 "moving the controller"` |
-| `mem dinit --id <id> [--all-or-nothing]` merges the shard into main under the lock and reports what was merged, conflicted, proposed or skipped. | `mem dinit --id s7` |
+| `mem dinit --id <id> [--all-or-nothing]` merges the shard into main under the lock and reports what was merged, conflicted, proposed or skipped. A clean dinit stops the shard's session before it closes the shard. | `mem dinit --id s7` |
 | `mem resolve-conflict <address\|path.md> --take shard\|main\|<value> --why ... [--shard <id>]` settles a recorded conflict on main. | `mem resolve-conflict devices/ctl/ip --take shard --why "s7's switch is live"` |
 | `mem soul approve <shard-id> --human <admin>` writes a shard's pending soul proposal to main. Admins only. | `mem soul approve s7 --human Ada` |
-| `mem board [--json]` shows every open shard (human, state, gist, last activity, facts in flight, last few actions), then overlaps, open conflicts and soul proposals. Takes no lock. | `mem board --json` |
+| `mem board [--json]` shows every open shard (human, state, pane, gist, last activity, facts in flight, last few actions), then overlaps, open conflicts and soul proposals. Takes no lock. | `mem board --json` |
 | `mem watch [--once]` evaluates the triggers every `poll_secs`, records events and wakes the core. `--once` runs one pass and exits. | `mem watch --once` |
 | `mem core context` prints `mem board --json` and the pending events as one JSON document: everything a woken core needs. | `mem core context` |
 | `mem core start [--resume]` starts the core in its own tmux pane with a first message, and pins its session id. A no-op if it is running. `--resume` resumes the pinned session instead of starting a fresh one. | `mem core start` |
@@ -104,6 +111,65 @@ exactly as on main, but they commit to `shard/s7`:
 
 The status line lives in `.shards/status/<id>.json`, outside git, so it can never cause
 a merge conflict.
+
+### A shard is a session in its own pane
+
+A shard is a whole agent session, the same shape as the core, not a sub-agent.
+`mem shard start --human Ada` opens the shard, then starts `[shards] command` (default
+`claude`) in a pane whose shell sits in the shard's worktree, with `SHARDS_MEMORY` and
+`SHARDS_SHARD` set. It prints the id, the session and the attach command.
+
+- **One shards server.** Every shard's pane is on one tmux server
+  (`[shards] socket`, default `.shards/sessions/tmux.sock`), separate from the core's
+  and from your own tmux. Each shard is its own tmux session there (one window, named
+  after the shard, with `.` shown as `~`), so two people can attach to two shards at
+  once without switching each other's window.
+- **Pinned up front.** The session id is chosen before the session starts
+  (`claude --session-id <uuid>`) and recorded with the shard in
+  `.shards/shards/<id>.json` under `session`. So a blank session is pinned even though
+  Claude Code writes no transcript until its first message. The core finds its id from
+  the transcript after its first message instead; a blank shard has no first message.
+- **Blank for now.** A shard starts with no soul, profile or first message. Inits and
+  dinits come later; `ShardLaunch` in `shardsession.rs` is where they plug in.
+- **Up until someone is done.** Nothing stops a shard's pane for being idle or stale:
+  not the board, not the watcher. It stays up until `mem shard stop`, or until a clean
+  `mem dinit` closes the shard, which stops the session first.
+- **Stop and resume.** `mem shard stop` types `/exit`, waits for the pane's shell, and
+  closes the pane (killing the command only if it won't exit). Branch, worktree and pin
+  stay. `mem shard start --id s7 --resume` resumes the pinned session by its explicit id
+  (`--resume <id>`, never `--continue`). A pinned session that never got a message has
+  no transcript to resume, so it starts blank again under the same id. A shard made with
+  `mem shard open` gets a session pinned on its first `--resume`.
+- **Talking to it.** `mem shard attach`, or `mem shard send`, which refuses unless the
+  agent is running and waiting. Typed into a bare shell, text would run as a command.
+  The message is folded into one line (a blank line becomes ` | `, other line breaks a
+  space), since Enter would send early. It is typed, checked on screen, entered, and
+  confirmed as a new prompt in *that* session's transcript, found by its pinned id.
+- **Outliving the launcher.** A new tmux server starts in its own systemd user scope
+  (`systemd-run --user --scope`) when there is a user manager. Otherwise a server
+  started from a service (a web UI, say) would sit in that service's cgroup, and
+  restarting the service would kill every pane. `SHARDS_TMUX_SCOPE=0` turns this off.
+  The core's server does the same.
+
+**Folder trust.** Claude Code asks "do you trust this folder?" the first time it runs in
+a folder, and every shard gets a new worktree. Claude Code keeps that answer per
+*canonical* git root, though, and a shard's worktree is a git worktree of the memory. So
+trusting the **memory root** once covers every shard, wherever `worktree_dir` points
+(checked on Claude Code 2.1.319, with worktrees inside and outside the memory). Trust
+it once by running `claude` in the memory root and answering, or by attaching to a core
+that runs there. `mem shard start` reads Claude Code's config (`[shards] claude_config`,
+default `$CLAUDE_CONFIG_DIR/.claude.json` or `~/.claude.json`) and never writes it. If
+the root isn't trusted, it refuses before opening anything and says how to fix it. If a
+trust question shows in the pane anyway, the start fails at once with that reason. The
+pane is closed, and the shard stays open for `--resume`.
+
+Measured on Claude Code 2.1.319 (haiku): an idle shard pane (its shell plus Claude
+Code) holds about 255 MiB RSS (180 MiB PSS) blank, and about 265–275 MiB RSS after a
+few turns.
+
+Give the command the permissions shards should have, for example
+`command = "claude --permission-mode acceptEdits"`. Tool permission prompts appear in
+the pane, like any Claude Code session.
 
 ## Dinit
 
@@ -273,12 +339,12 @@ a fake transcript and check that neither shows up in any output or state file.
 ### The board: `mem board`
 
 ```text
-s1  Ada  active  last activity 2m ago (transcript)  in flight: 1 fact(s)
+s1  Ada  active  pane up  last activity 2m ago (transcript)  in flight: 1 fact(s)
     gist:   moving the kiln controller
     flight: devices/kiln-east/ip  (* uncommitted)
      3m ago  Edit  ip.md
      2m ago  Bash  curl -H "Authorization: Bearer [REDACTED]" https://kiln.example.invalid/…
-s2  Basil  idle  last activity 14m ago (worktree)  in flight: 1 fact(s)
+s2  Basil  idle  pane down  last activity 14m ago (worktree)  in flight: 1 fact(s)
     flight: devices/kiln-east/ip*  (* uncommitted)
 
 overlaps:
@@ -330,7 +396,9 @@ change.
     "recent_actions": [                        // at most 5, newest last
       { "at": "2026-11-04T22:49:00.000Z", "tool": "Edit", "summary": "ip.md" }
     ],
-    "soul_pending": []
+    "soul_pending": [],
+    "pane": "up",                              // "up" | "shell" (session exited) | "down"
+    "session_id": "1b9d6bcd-…"                 // the pinned session; null if none
   }],
   "overlaps": [{
     "kind": "same-fact",                       // or "same-section"
@@ -572,6 +640,10 @@ admins = ["Ada", "Basil"]   # humans who may approve soul changes
 [shards]
 keep_branches = true               # keep shard/<id> after a clean dinit (false: branch -d)
 worktree_dir = ".shards/worktrees" # relative to the memory root, or absolute
+command = "claude"                 # typed into each shard's pane by mem shard start
+adapter = "claude-code"            # "claude-code": --session-id <uuid>, --resume <id> | "plain"
+socket = ".shards/sessions/tmux.sock"  # the shards' one tmux server
+claude_config = ""                 # empty: $CLAUDE_CONFIG_DIR/.claude.json or ~/.claude.json (read only)
 
 [activity]
 source = "claude-code"  # "claude-code": read session transcripts | "none": git only
@@ -605,6 +677,7 @@ watchdog = true         # mem watch restores a dead core and resumes its pinned 
 start_timeout_secs = 60 # a start, resume or handoff must come up (and pin) in this long
 exit_timeout_secs = 30  # the core must exit this soon after /exit
 land_timeout_secs = 10  # a typed line must show in the pane / transcript this soon
+                        # (these three timeouts apply to shard sessions too)
 keep_warm = false       # ping an idle core with [HH:MM] (for measuring)
 keep_warm_mins = 50
 keep_warm_quiet_limit = 8
@@ -613,8 +686,9 @@ keep_warm_quiet_limit = 8
 Local state that is never committed lives in `.shards/`: `worktrees/`, `shards/`
 (shard records), `status/`, `locks/`, `lock.log`, `activity/` (per-shard activity
 summaries and transcript offsets), `events.jsonl`, `watch.json` (watcher state),
-`wake.log` and `core/` (`session.json`, `state.json`, `core.log`, `usage.jsonl`,
-`first-message.md`, `core.lock` and the tmux socket).
+`wake.log`, `core/` (`session.json`, `state.json`, `core.log`, `usage.jsonl`,
+`first-message.md`, `core.lock` and the tmux socket) and `sessions/` (the shards' tmux
+socket, `sessions.log`, and a lock per shard that serializes start, stop and send).
 
 Address rules: at least `section/name`. Segments use only `a-z 0-9 - _ .`, start with a
 letter or digit, and carry no `facts/` prefix or `.md` suffix. Lowercase only, so two
