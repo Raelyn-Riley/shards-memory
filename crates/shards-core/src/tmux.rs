@@ -93,6 +93,44 @@ impl Tmux {
         format!("={}:", self.session)
     }
 
+    /// Is a tmux server listening on this socket?
+    pub fn server_running(&self) -> bool {
+        self.output(&["list-sessions"])
+            .is_ok_and(|o| o.status.success())
+    }
+
+    /// Start the server (with its first session) in its own transient
+    /// systemd user scope, so it outlives whatever ran `mem`. Without that,
+    /// a server started from a service (Parlor, say) sits in the service's
+    /// cgroup, and restarting the service kills every pane on it. False if
+    /// there is no systemd user manager to ask, or
+    /// `SHARDS_TMUX_SCOPE=0`; the caller then starts it the plain way.
+    fn new_server_in_scope(&self, args: &[&str]) -> bool {
+        if std::env::var("SHARDS_TMUX_SCOPE").is_ok_and(|v| v == "0")
+            || std::env::var_os("XDG_RUNTIME_DIR").is_none()
+        {
+            return false;
+        }
+        Command::new("systemd-run")
+            .args([
+                "--user",
+                "--scope",
+                "--quiet",
+                "--collect",
+                "--",
+                "tmux",
+                "-S",
+            ])
+            .arg(&self.socket)
+            .args(args)
+            .env_remove("TMUX")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
     /// Does the session exist?
     pub fn has_session(&self) -> bool {
         self.output(&["has-session", "-t", &self.target()])
@@ -133,7 +171,11 @@ impl Tmux {
         line.push_str(" /bin/sh");
         args.push(line);
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        self.run(&refs)?;
+        if !self.server_running() && self.new_server_in_scope(&refs) && self.has_session() {
+            // Started in its own scope.
+        } else {
+            self.run(&refs)?;
+        }
         // Keep a dead shell's pane around, so status can say so.
         let _ = self.run(&["set-option", "-t", &self.target(), "remain-on-exit", "on"]);
         let _ = self.run(&["set-option", "-t", &self.target(), "history-limit", "5000"]);
