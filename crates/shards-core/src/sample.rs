@@ -328,30 +328,40 @@ pub fn fake_transcript(
     Ok(path)
 }
 
-/// A FAKE reasoning core for tests. It never calls a model: it reads lines
-/// from its terminal and writes a Claude Code-shaped transcript, one
-/// prompt and one reply (with made-up token usage and a planted reply text)
-/// per line. Usage:
+/// A FAKE agent session (the core, or a shard) for tests. It never calls a
+/// model: it reads lines from its terminal and writes a Claude Code-shaped
+/// transcript, one prompt and one reply (with made-up token usage and a
+/// planted reply text) per line. Like Claude Code, it writes no transcript
+/// until the first prompt, and `--resume` of an id with no transcript fails.
+/// Usage:
 ///
-/// `sh fake-core.sh <projects> <ctl> [--resume <id>] [-- <first message>]`
+/// `sh fake-core.sh <projects> <ctl> [--resume <id> | --session-id <id>] [-- <first message>]`
 ///
 /// Each start appends `args: ...` to `<ctl>/starts.log`. Files in `<ctl>`
 /// change its behaviour: `fail-all` (exit at once), `fail-fresh` (exit at
 /// once unless resuming), `ignore-exit` (`/exit` does nothing),
 /// `slow-exit` (`/exit` takes 2 s), `cold` (replies report a cache write
-/// instead of a cache read).
+/// instead of a cache read), `trust-prompt` (show Claude Code's "trust this
+/// folder" question and wait).
 pub const FAKE_CORE: &str = r#"#!/bin/sh
 projects=$1; ctl=$2; shift 2
 echo "args: $*" >> "$ctl/starts.log"
-id=""
-if [ "$1" = "--resume" ]; then id=$2; shift 2; fi
+id=""; resume=""
+if [ "$1" = "--resume" ]; then id=$2; resume=1; shift 2; fi
+if [ "$1" = "--session-id" ]; then id=$2; shift 2; fi
 [ "$1" = "--" ] && shift
 [ -e "$ctl/fail-all" ] && exit 3
-[ -z "$id" ] && [ -e "$ctl/fail-fresh" ] && exit 4
+[ -z "$resume" ] && [ -e "$ctl/fail-fresh" ] && exit 4
 [ -z "$id" ] && id=$(cat /proc/sys/kernel/random/uuid)
 slug=$(printf %s "$PWD" | sed 's/[^A-Za-z0-9]/-/g')
-mkdir -p "$projects/$slug"
 tx="$projects/$slug/$id.jsonl"
+# Like Claude Code: nothing to resume without a transcript.
+[ -n "$resume" ] && [ ! -f "$tx" ] && { echo "No conversation found with session ID: $id"; exit 1; }
+if [ -e "$ctl/trust-prompt" ]; then
+  printf ' Accessing workspace:\n %s\n Is this a project you trust?\n \342\235\257 No, exit\n   Yes, I trust this folder\n' "$PWD"
+  read -r answer; exit 0
+fi
+mkdir -p "$projects/$slug"
 n=0
 ts() { date -u +%Y-%m-%dT%H:%M:%S.%3NZ; }
 esc() { printf %s "$1" | tr '\n\t' '  ' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
@@ -367,6 +377,7 @@ turn() {
 }
 [ $# -gt 0 ] && turn "$1"
 echo "fake-core: session $id ready"
+printf '\342\235\257 \n'
 while IFS= read -r line; do
   case "$line" in
     /exit)

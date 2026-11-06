@@ -57,6 +57,9 @@ pub struct ShardMeta {
     /// The shard commit the pending soul files are taken from.
     #[serde(default)]
     pub soul_commit: Option<String>,
+    /// The shard's agent session, pinned by `mem shard start`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<crate::shardsession::ShardSession>,
 }
 
 /// A one-line gist of what a shard is doing.
@@ -115,6 +118,8 @@ pub struct DinitReport {
     pub branch_deleted: bool,
     /// Why the shard stayed open despite a clean dinit, if it did.
     pub kept_open: Option<String>,
+    /// A clean dinit stopped the shard's running session.
+    pub session_stopped: bool,
 }
 
 /// How to settle a conflict.
@@ -182,7 +187,7 @@ impl Memory {
         })
     }
 
-    fn save_meta(&self, meta: &ShardMeta) -> Result<()> {
+    pub(crate) fn save_meta(&self, meta: &ShardMeta) -> Result<()> {
         fs::create_dir_all(self.shards_dir())?;
         let tmp = self.shards_dir().join(format!(".{}.json.tmp", meta.id));
         fs::write(
@@ -256,6 +261,7 @@ impl Memory {
             worktree,
             soul_pending: Vec::new(),
             soul_commit: None,
+            session: None,
         };
         main.save_meta(&meta)?;
         Ok(meta)
@@ -653,6 +659,8 @@ impl Memory {
     /// After a clean dinit: remove the worktree, maybe the branch, and the
     /// shard's local state. A worktree with uncommitted changes is kept.
     fn close_shard(&self, meta: &ShardMeta, report: &mut DinitReport) -> Result<()> {
+        // A shard is a session in a pane: end it before its worktree goes.
+        report.session_stopped = self.shard_session_end(meta);
         if meta.worktree.exists() {
             let wt = meta.worktree.to_string_lossy().to_string();
             if let Err(e) = self.git.run(&["worktree", "remove", &wt]) {

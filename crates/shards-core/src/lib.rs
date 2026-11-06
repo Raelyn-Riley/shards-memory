@@ -25,6 +25,7 @@ pub mod pane;
 pub mod pointer;
 pub mod sample;
 pub mod shard;
+pub mod shardsession;
 pub mod tmux;
 pub mod watch;
 
@@ -37,4 +38,5 @@ pub use fact::{Fact, FrontMatter};
 pub use memory::{Context, Fact as StoredFact, HistoryEntry, Memory, Provenance};
 pub use pointer::{resolve, ResolveOptions};
 pub use shard::{Conflict, DinitReport, ShardInfo, ShardMeta, ShardStatus, Side, Take};
+pub use shardsession::{PaneState, ShardSession, ShardStart};
 pub use watch::{CoreContext, Event, PassReport, WakeOutcome};

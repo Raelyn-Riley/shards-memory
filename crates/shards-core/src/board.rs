@@ -94,6 +94,11 @@ pub struct ShardRow {
     /// Newest last.
     pub recent_actions: Vec<Action>,
     pub soul_pending: Vec<String>,
+    /// The shard's pane: `up` (its session is running), `shell` (the pane
+    /// is up but the session exited) or `down`.
+    pub pane: crate::shardsession::PaneState,
+    /// The pinned session id, once `mem shard start` has pinned one.
+    pub session_id: Option<String>,
 }
 
 impl ShardRow {
@@ -326,6 +331,12 @@ impl Memory {
             facts_in_flight,
             recent_actions: recent,
             soul_pending: info.meta.soul_pending.clone(),
+            pane: self.shard_pane_state(&info.meta.id),
+            session_id: info
+                .meta
+                .session
+                .as_ref()
+                .and_then(|s| s.session_id.clone()),
         })
     }
 

@@ -10,9 +10,11 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use shards_core::board::{human_age, Board};
 use shards_core::coresession::summarize_usage;
+use shards_core::coresession::Landed;
+use shards_core::shardsession::ShardLaunch;
 use shards_core::{
     resolve, sample, Address, CoreStatus, DinitReport, Memory, PassReport, Provenance,
-    ResolveOptions, Side, StartReport, Take, UsageEntry, WakeOutcome,
+    ResolveOptions, ShardMeta, ShardStart, Side, StartReport, Take, UsageEntry, WakeOutcome,
 };
 
 #[derive(Parser)]
@@ -157,8 +159,43 @@ enum ShardCmd {
         #[arg(long, env = "SHARDS_HUMAN")]
         human: Option<String>,
     },
-    /// Open shards: human, base, last commit, status line.
-    List,
+    /// Open a shard and start its session in its own tmux pane (blank: no
+    /// first message). With --resume, bring an open shard's pinned session back.
+    Start {
+        /// The shard id (default: the first free s<n>). Required with --resume.
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long, env = "SHARDS_HUMAN")]
+        human: Option<String>,
+        /// Resume the shard's pinned session (after mem shard stop).
+        #[arg(long)]
+        resume: bool,
+    },
+    /// End a shard's session cleanly; keeps its branch, worktree and pinned session.
+    Stop {
+        #[arg(long)]
+        id: String,
+    },
+    /// Attach to a shard's pane (prints the command when not on a terminal).
+    Attach {
+        #[arg(long)]
+        id: String,
+        /// Only print the tmux command.
+        #[arg(long)]
+        print: bool,
+    },
+    /// Type one message into a shard's pane and confirm its session got it.
+    Send {
+        #[arg(long)]
+        id: String,
+        /// The message; `-` reads stdin. Line breaks are folded into one line.
+        text: String,
+    },
+    /// Open shards: human, pane, session, base, last commit, status line.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
     /// Set a shard's one-line status ("working on X").
     Status {
         #[arg(long)]
@@ -290,6 +327,9 @@ fn print_dinit(out: &mut impl Write, r: &DinitReport) -> io::Result<()> {
     for p in &r.skipped {
         writeln!(out, "  skipped   {p}  (dinit never merges this)")?;
     }
+    if r.session_stopped {
+        writeln!(out, "shard {}'s session was stopped first", r.shard)?;
+    }
     if r.closed {
         writeln!(
             out,
@@ -317,10 +357,11 @@ fn print_board(out: &mut impl Write, b: &Board) -> io::Result<()> {
         let others = s.in_flight.len() - s.facts_in_flight;
         writeln!(
             out,
-            "{}  {}  {}  last activity {} ago ({})  in flight: {} fact(s){}",
+            "{}  {}  {}  pane {}  last activity {} ago ({})  in flight: {} fact(s){}",
             s.id,
             s.human.as_deref().unwrap_or("-"),
             s.state.as_str(),
+            s.pane.as_str(),
             human_age(s.age_secs),
             s.last_activity_from,
             s.facts_in_flight,
@@ -560,6 +601,14 @@ fn print_usage(out: &mut impl Write, entries: &[UsageEntry]) -> io::Result<()> {
     Ok(())
 }
 
+/// A shard's pinned session id, for printing.
+fn session_of(meta: &ShardMeta) -> String {
+    match &meta.session {
+        Some(s) => s.session_id.clone().unwrap_or_else(|| "(no id)".into()),
+        None => "-".into(),
+    }
+}
+
 fn read_value(v: String) -> io::Result<String> {
     if v == "-" {
         let mut s = String::new();
@@ -675,18 +724,114 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 short(&meta.base)
             );
         }
-        Cmd::Shard(ShardCmd::List) => {
+        Cmd::Shard(ShardCmd::Start { id, human, resume }) => {
+            let mem = Memory::open(&cli.memory)?;
+            match mem.shard_start(id.as_deref(), human.as_deref(), resume, ShardLaunch::Blank)? {
+                ShardStart::AlreadyRunning { meta } => writeln!(
+                    out,
+                    "shard {} is already running (session {}); nothing to do",
+                    meta.id,
+                    session_of(&meta)
+                )?,
+                ShardStart::Started {
+                    meta,
+                    resumed,
+                    note,
+                } => {
+                    writeln!(
+                        out,
+                        "shard {} {} in its pane; session {}",
+                        meta.id,
+                        if resumed { "resumed" } else { "started" },
+                        session_of(&meta)
+                    )?;
+                    writeln!(out, "worktree: {}", meta.worktree.display())?;
+                    if let Some(n) = note {
+                        writeln!(out, "note: {n}")?;
+                    }
+                    writeln!(
+                        out,
+                        "attach: {}",
+                        mem.shard_attach_command(&meta.id)?.join(" ")
+                    )?;
+                }
+            }
+        }
+        Cmd::Shard(ShardCmd::Stop { id }) => {
+            let mem = Memory::open(&cli.memory)?;
+            if mem.shard_stop(&id)? {
+                writeln!(
+                    out,
+                    "shard {id} stopped; branch, worktree and session kept (mem shard start --id {id} --resume)"
+                )?;
+            } else {
+                writeln!(out, "shard {id} was not running")?;
+            }
+        }
+        Cmd::Shard(ShardCmd::Attach { id, print }) => {
+            use std::io::IsTerminal;
+            let mem = Memory::open(&cli.memory)?;
+            let cmd = mem.shard_attach_command(&id)?;
+            if print || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+                writeln!(out, "{}", cmd.join(" "))?;
+            } else {
+                drop(out);
+                mem.shard_attach(&id)?;
+                return Ok(());
+            }
+        }
+        Cmd::Shard(ShardCmd::Send { id, text }) => {
+            let mem = Memory::open(&cli.memory)?;
+            let text = read_value(text)?;
+            match mem.shard_send(&id, &text)? {
+                Landed::Confirmed => writeln!(out, "sent to {id}")?,
+                Landed::Unconfirmed => writeln!(
+                    out,
+                    "sent to {id} (typed and entered; not yet seen in its transcript)"
+                )?,
+            }
+        }
+        Cmd::Shard(ShardCmd::List { json }) => {
             let mem = Memory::open(&cli.memory)?;
             let shards = mem.shard_list()?;
+            if json {
+                let rows: Vec<serde_json::Value> = shards
+                    .iter()
+                    .map(|s| {
+                        let id = &s.meta.id;
+                        serde_json::json!({
+                            "id": id,
+                            "human": s.meta.human,
+                            "branch": s.meta.branch,
+                            "opened": s.meta.opened,
+                            "worktree": s.meta.worktree,
+                            "pane": mem.shard_pane_state(id).as_str(),
+                            "session": s.meta.session,
+                            "transcript": mem.shard_transcript(id).ok().flatten(),
+                            "gist": s.status.as_ref().map(|g| g.gist.clone()),
+                        })
+                    })
+                    .collect();
+                writeln!(
+                    out,
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({ "format": 1, "shards": rows })
+                    )?
+                )?;
+                return Ok(());
+            }
             if shards.is_empty() {
                 writeln!(out, "no open shards")?;
             }
             for s in shards {
                 writeln!(
                     out,
-                    "{}  human: {}  base: {}  last commit: {}",
+                    "{}  human: {}  pane: {}  session: {}  base: {}  last commit: {}",
                     s.meta.id,
                     s.meta.human.as_deref().unwrap_or("-"),
+                    mem.shard_pane_state(&s.meta.id).as_str(),
+                    session_of(&s.meta),
                     short(&s.meta.base),
                     s.last_commit
                 )?;
