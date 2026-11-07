@@ -73,8 +73,8 @@ Global: `-C, --memory <dir>` (or `SHARDS_MEMORY`) picks the memory and defaults 
 | `mem resolve [file\|-] [--annotate]` replaces every `{{fact:...}}` with the current value. `--annotate` gives `10.0.4.41 [devices/rotoforge-ctl/ip]`. Any unresolvable pointer is an error that names it. | `mem resolve notes/runbook.md --annotate` |
 | `mem gen-sample <dir> --seed N` builds a fake flock: 3 birds, 30 facts in 4 sections, 3 supersedes, 3 notes with pointers. The same seed gives byte-identical commits. | `mem gen-sample /tmp/flock --seed 7` |
 | `mem put <path> [file\|-] --why ...` writes a `notes/`, `people/` or `soul/` markdown file as one commit. Writing `soul/` on main needs an admin `--human`. | `mem put people/ada.md profile.md --why "prefers short answers"` |
-| `mem put <note> [file\|-] --for PERSON --why ...` writes the note into `notes/<person>/`. `notes/kiln.md` and `kiln.md` both become `notes/<person>/kiln.md`. Without `--for`, `notes/<file>.md` is a shared note, as before. | `mem put notes/kiln.md --for ada --why "vent tip"` |
-| `mem notes find <word> --for PERSON [--json]` searches every note for the word (any case, in its text or path). It lists that person's own notes first, then the shared notes, then everyone else's, newest first within each. Each result names whose note it is and its date. | `mem notes find kiln --for ada` |
+| `mem put <note> [file\|-] --for PERSON --why ...` writes the note into `notes/<person>/`. `notes/kiln.md` and `kiln.md` both become `notes/<person>/kiln.md`. The person matches an existing folder in any case; a new folder is lowercase. Without `--for`, `notes/<file>.md` is a shared note, as before. | `mem put notes/kiln.md --for ada --why "vent tip"` |
+| `mem notes find <word> --for PERSON [--json]` searches every note for the word (any case, in its text or path). From a shard it searches the shard's branch and main. It lists that person's own notes (their folder in any case) first, then the shared notes, then everyone else's, newest first within each. Each result names whose note it is and its date. | `mem notes find kiln --for ada` |
 | `mem shard open --id <id> [--human <name>]` creates branch `shard/<id>` from main in its own worktree and prints the worktree path. | `cd "$(mem shard open --id s7 --human Ada)"` |
 | `mem shard start [--id <id>] --human <name>` opens a shard (as `shard open` does) and starts its session in its own pane, pinned to a session id. Blank for now: no first message. The id defaults to the first free `s<n>`. | `mem shard start --human Ada` |
 | `mem shard start --id <id> --resume` brings a stopped shard's pinned session back by its id. A no-op if it is running. | `mem shard start --id s7 --resume` |
@@ -718,15 +718,21 @@ are pointers (`{{fact:...}}`).
 
 - **Shared notes** sit at the top of `notes/`: `notes/runbook.md`.
 - **A person's own notes** sit in their folder: `notes/<person>/...`. The folder name is
-  the person, matched exactly, so `--for ada` and `--for Ada` are two folders. Any
-  folder under `notes/` counts as a person's.
+  the person, in any case: `--for Dave`, `--for dave` and a folder `notes/DAVE/` are the
+  same person. `mem put --for` writes into an existing folder that matches in any case
+  (on the shard's branch or on main), and makes a lowercase one if none does. If two
+  folders differ only by case, both are the person's, and a put goes to the one spelled
+  exactly as given, else the first by name. Any folder under `notes/` counts as a
+  person's.
 
 Notes are written like any other `notes/` file. In a shard they ride the shard's branch,
 and `mem dinit` merges them with no core review, the same as before. A note changed in
 two shards is a conflict like any other.
 
-`mem notes find` reads HEAD of the memory it is pointed at. From a shard's pane that is
-the shard's branch: its own notes plus main's as of when it opened. A note's date is the
+`mem notes find` reads HEAD of the memory it is pointed at. From a shard's pane it reads
+the shard's branch **and** main, so it sees notes merged after the shard opened. A note
+on both counts once, with the shard's version (the newer edit in that session). A note
+the shard deleted stays out, even though main still has it. On main it reads main. A note's date is the
 author date of the newest commit that changed it, which is the write's own timestamp.
 
 ```text
@@ -828,7 +834,8 @@ file.
 | `keep_warm_mins` | `[core] keep_warm_mins` |
 | `quirk_archive_days` | `[quirks] archive_after_days` (the default was 30; it is now 90) |
 
-The `shards.toml` that `mem init` writes still uses the old places.
+`mem init` writes every duration in `[intervals]` and none in the old places. A file
+written by an older `mem init` keeps working as it is.
 
 Local state that is never committed lives in `.shards/`: `worktrees/`, `shards/`
 (shard records), `status/`, `locks/`, `lock.log`, `activity/` (per-shard activity
