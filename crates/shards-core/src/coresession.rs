@@ -79,6 +79,9 @@ pub struct Sent {
     pub idle_secs: Option<f64>,
     #[serde(default)]
     pub events: Option<usize>,
+    /// It landed as a queued line (the core was busy), not a new prompt.
+    #[serde(default)]
+    pub queued: bool,
 }
 
 /// `.shards/core/state.json`.
@@ -186,6 +189,10 @@ pub struct UsageEntry {
     /// The reply's first model call, which shows whether the cache was warm.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first: Option<Usage>,
+    /// Queued into a turn that an earlier entry already counted: its usage
+    /// is in that entry, so it is left out of the summary.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub same_turn: bool,
 }
 
 impl UsageEntry {
@@ -239,7 +246,7 @@ pub fn summarize_usage(entries: &[UsageEntry]) -> Vec<UsageRow> {
             .unwrap_or(0)
     };
     let mut groups: BTreeMap<(String, usize, String), Vec<&UsageEntry>> = BTreeMap::new();
-    for e in entries {
+    for e in entries.iter().filter(|e| !e.same_turn) {
         let gap = gap_bucket(e.gap_secs).to_string();
         groups
             .entry((e.kind.clone(), order(&gap), gap))
@@ -390,7 +397,8 @@ impl Core {
         self.pane.type_line(text)
     }
 
-    /// Type a line to the running core and confirm it reached the session.
+    /// Type a line to the running core and confirm it reached the session,
+    /// noting on the last [`Sent`] whether it was queued (the core was busy).
     fn deliver(&self, st: &mut CoreState, text: &str) -> Result<Landed> {
         let path = self.transcript();
         if let Some(p) = &path {
@@ -405,6 +413,9 @@ impl Core {
         loop {
             st.scan.update(&path);
             if st.scan.landed_since(before) {
+                if let Some(s) = st.awaiting.last_mut() {
+                    s.queued = st.scan.prompts == before.0;
+                }
                 return Ok(Landed::Confirmed);
             }
             if start.elapsed() >= self.cfg.land_timeout() {
@@ -496,10 +507,25 @@ impl Core {
                 st.awaiting.remove(0);
                 continue;
             };
-            let reply = st.scan.reply_after(s.after.max(st.last_counted)).cloned();
+            let reply = st
+                .scan
+                .reply_for(s.after, s.queued, st.last_counted)
+                .map(|(t, shared)| (t.clone(), shared));
             let entry = match reply {
-                Some(t) => {
-                    st.last_counted = t.seq;
+                Some((_, true)) => UsageEntry {
+                    time: s.at.clone(),
+                    kind: s.kind.clone(),
+                    gap_secs: s.gap_secs,
+                    idle_secs: s.idle_secs,
+                    events: s.events,
+                    reply: true,
+                    calls: 0,
+                    usage: Usage::default(),
+                    first: None,
+                    same_turn: true,
+                },
+                Some((t, false)) => {
+                    st.last_counted = st.last_counted.max(t.seq);
                     UsageEntry {
                         time: s.at.clone(),
                         kind: s.kind.clone(),
@@ -510,6 +536,7 @@ impl Core {
                         calls: t.calls,
                         usage: t.total,
                         first: t.first,
+                        same_turn: false,
                     }
                 }
                 None if (now - at).num_seconds() > REPLY_WAIT_SECS => UsageEntry {
@@ -522,6 +549,7 @@ impl Core {
                     calls: 0,
                     usage: Usage::default(),
                     first: None,
+                    same_turn: false,
                 },
                 None => break,
             };
@@ -552,6 +580,7 @@ impl Core {
             gap_secs: gap,
             idle_secs: idle,
             events,
+            queued: false,
         });
         st.last_sent = Some(rfc3339(now));
     }

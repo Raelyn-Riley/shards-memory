@@ -335,6 +335,11 @@ pub struct Turn {
     pub total: Usage,
     pub calls: u32,
     pub done: bool,
+    /// Lines typed while this turn was busy that Claude Code queued and
+    /// then fed into this same turn at a tool call (`queued_command`
+    /// attachments), rather than as a new prompt.
+    #[serde(default)]
+    pub absorbed: u32,
     /// Message id -> usage, while the turn is open (records of one message
     /// repeat its usage; the last one wins). Emptied when the turn ends.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -510,6 +515,26 @@ impl TranscriptScan {
                     self.turns.drain(..drop);
                 }
             }
+            // A queued line fed into the open turn at a tool call: the
+            // turn is its reply. The text is checked for a heartbeat only.
+            Some("attachment") => {
+                let Some(a) = v
+                    .get("attachment")
+                    .filter(|a| a.get("type").and_then(Value::as_str) == Some("queued_command"))
+                else {
+                    return;
+                };
+                let heartbeat = a
+                    .get("prompt")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_heartbeat);
+                if !heartbeat {
+                    bump(&mut self.last_real, at);
+                }
+                if let Some(t) = self.open_turn() {
+                    t.absorbed += 1;
+                }
+            }
             Some("queue-operation") => {
                 if v.get("operation").and_then(Value::as_str) == Some("enqueue") {
                     bump(&mut self.last_queued, at);
@@ -549,6 +574,26 @@ impl TranscriptScan {
     /// The first finished turn whose prompt came after prompt number `after`.
     pub fn reply_after(&self, after: u64) -> Option<&Turn> {
         self.turns.iter().find(|t| t.done && t.seq > after)
+    }
+
+    /// The reply to a line typed when the transcript stood at prompt
+    /// `after`, with turns up to `counted` already counted. A line that was
+    /// `queued` (typed while turn `after` was busy) is usually fed into that
+    /// same turn, which is then its reply; the bool says that turn was
+    /// already counted for an earlier line. Otherwise the reply is the
+    /// first finished turn after both. `None`: not finished yet.
+    pub fn reply_for(&self, after: u64, queued: bool, counted: u64) -> Option<(&Turn, bool)> {
+        if queued {
+            if let Some(t) = self.turns.iter().find(|t| t.seq == after) {
+                if !t.done {
+                    return None;
+                }
+                if t.absorbed > 0 {
+                    return Some((t, t.seq <= counted));
+                }
+            }
+        }
+        self.reply_after(after.max(counted)).map(|t| (t, false))
     }
 }
 
