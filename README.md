@@ -22,7 +22,8 @@ configured trigger fires. The reasoning core is one long-lived chat session in a
 pane, so it remembers what it has reasoned about. Built so far: facts, supersede,
 history, pointers, shards (each a session in its own pane), dinit, conflicts, soul
 approval, locks with lease-based crash recovery, the board, the watcher, the core
-session (pane wakes, watchdog, handoff, keep-warm), and a fake-data generator. Shard
+session (pane wakes, watchdog, handoff, keep-warm), the known-quirks board, and a
+fake-data generator. Shard
 inits and dinits (soul, profile, first message), bulletins, the drift checker and the
 web UI come later. See [`docs/design.md`](docs/design.md) for the
 design. Licensed AGPL-3.0-or-later.
@@ -94,6 +95,13 @@ Global: `-C, --memory <dir>` (or `SHARDS_MEMORY`) picks the memory and defaults 
 | `mem core rinit --baton <file\|->` hands off to a fresh session in the same pane, whose first message carries the baton. | `mem core rinit --baton baton.md` |
 | `mem core usage [--json]` summarizes the token usage of wakes and pings by gap length, warm and cold. | `mem core usage` |
 | `mem core stop` stops the core deliberately. The watchdog leaves it stopped. | `mem core stop` |
+| `mem quirk add --tool T --quirk Q --by PERSON [--details D]` posts a known quirk straight to main, from any shard. The report time is automatic. Duplicates are fine. | `mem quirk add --tool bandsaw-2 --quirk "file handle is loose" --by Bob` |
+| `mem quirk list [--tool T] [--all] [--json]` lists open quirks, read from main. `--all` adds fixed and archived ones. | `mem quirk list --tool bandsaw-2` |
+| `mem quirk update <id> --status S --by PERSON` sets the status in words and reopens the quirk. The old status stays in history. | `mem quirk update q3 --status "worse when cold" --by Jim` |
+| `mem quirk fix <id> --by PERSON` sets the status to "fixed by PERSON" and starts the archive clock. | `mem quirk fix q3 --by Ada` |
+| `mem quirk mention <id> [--by PERSON]` records that a quirk came up again. This resets the archive clock, and an archived quirk goes back to fixed. | `mem quirk mention q3` |
+| `mem quirk archive [--days N]` archives fixed quirks with no fix or mention in N days (default `[quirks] archive_after_days`). | `mem quirk archive` |
+| `mem quirk history <id>` lists every version, newest first: time, commit, op, who, and the shard that wrote it. | `mem quirk history q3` |
 
 ## Shards
 
@@ -631,6 +639,51 @@ The core's transcript is read for times, prompt counts and token counts, and no 
 or reply text is stored or printed. A prompt is checked for one thing only, whether it
 is exactly `[HH:MM]`.
 
+## Known quirks
+
+A shop-wide board of what's weird about a tool right now. Bob tells his shard the
+bandsaw's file handle is loose. The shard runs `mem quirk add`, and when Jim says he is
+about to use the bandsaw, his shard runs `mem quirk list --tool bandsaw-2` and warns
+him. A quirk has a tool, the quirk, who reported it, when (set automatically), its last
+known status (who set it and when), and optional details.
+
+**Where quirks live.** There is one file per quirk, `quirks/q<n>.md`, committed
+**straight to `main`** from whichever worktree runs the command. A quirk never goes
+through a shard branch, a dinit or the core.
+
+- **Visible at once.** Every read goes to the `main` ref, which all worktrees share. A
+  quirk posted from shard A shows up in shard B's next `mem quirk list`, with no dinit
+  and no merge.
+- **No lost writes.** A quirk write takes the main lock for `quirks/` (`main` with store
+  scope, `main.quirks` with section scope) and the git mutex. Under them it reads main,
+  picks the next id and commits. Writers at the same moment simply queue, and each gets
+  its own id. Dinit holds the same git mutex, so a quirk can't land in the middle of a
+  merge.
+- **History like supersede.** `update`, `fix`, `mention` and `archive` each rewrite the
+  file as a new commit (`Shards-Op: quirk-<op>`, `Shards-Quirk`, `Shards-Human` = the
+  `--by` person). Old statuses stay in history. Nothing is ever deleted.
+- **Dinit leaves them alone.** Shards never change `quirks/` on their own branch, and
+  dinit builds its merge from main's tree, so quirks survive every merge.
+
+**Who wrote it.** The git author follows the usual rules: in a shard worktree it is the
+shard id. In a shard's pane, `SHARDS_MEMORY` is the main root, so when no `--author` is
+given, quirk commands use `SHARDS_SHARD`.
+
+**States.** `state` is what the code acts on, and `status` is the wording people see:
+
+- `open`: what `add` and `update` set. An open quirk is never archived.
+- `fixed`: what `fix` sets.
+- `archived`: what `archive` sets on a fixed quirk whose later fix or mention is older
+  than N days. N comes from `--days` or `[quirks] archive_after_days`, default 30.
+- A mention resets the clock. A mention of an archived quirk puts it back to `fixed`.
+
+**Duplicates** are allowed. Two reports of the same thing get two ids, and no human has
+to clean them up. Tidying them is left to a later scheduled core task.
+
+Seen on Claude Code 2.1.319 (haiku), with two real shards in a throwaway memory: shard A
+posted a quirk, and 25 s later shard B listed it with its branch still at its base. B
+then fixed it and A saw the fix on its next list.
+
 ## Config: `shards.toml`
 
 `shards.toml` sits at the memory root. `mem init` writes the defaults, and every key is
@@ -692,6 +745,9 @@ land_timeout_secs = 10  # a typed line must show in the pane / transcript this s
 keep_warm = false       # ping an idle core with [HH:MM] (for measuring)
 keep_warm_mins = 50
 keep_warm_quiet_limit = 8
+
+[quirks]                # optional; not written by mem init
+archive_after_days = 30 # mem quirk archive: fixed and not mentioned for this long
 ```
 
 Local state that is never committed lives in `.shards/`: `worktrees/`, `shards/`
