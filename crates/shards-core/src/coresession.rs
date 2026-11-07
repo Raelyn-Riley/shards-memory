@@ -37,7 +37,7 @@ use crate::coreadapter::{adapter_for, parse, CoreAdapter, Launch, TranscriptScan
 use crate::error::{Error, Result};
 use crate::lock::FileMutex;
 use crate::memory::Memory;
-use crate::pane::PaneRunner;
+use crate::pane::{pane_path, PaneRunner};
 use crate::tmux::{self, Tmux};
 
 /// Consecutive failed restores after which the watchdog stops trying.
@@ -642,6 +642,8 @@ impl Memory {
                     "SHARDS_MEMORY".to_string(),
                     root.to_string_lossy().into_owned(),
                 ),
+                // As a shard's pane: `mem`'s directory, `~/.local/bin`, `~/bin`.
+                ("PATH".to_string(), pane_path()),
                 ("PS1".to_string(), PS1.to_string()),
                 ("ENV".to_string(), String::new()),
             ],
