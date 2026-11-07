@@ -125,6 +125,36 @@ impl World {
             .filter(|p| p.starts_with("[WAKE]"))
             .collect()
     }
+    /// Queued lines the fake core fed into a busy turn in session `id`.
+    fn absorbed(&self, id: &str) -> Vec<String> {
+        fs::read_to_string(self.transcript(id))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["attachment"]["type"] == "queued_command")
+            .filter_map(|v| v["attachment"]["prompt"].as_str().map(String::from))
+            .collect()
+    }
+    /// Keep the fake core busy for `secs` seconds (a turn with tool calls),
+    /// as a person typing into its pane would.
+    fn busy(&self, id: &str, secs: u32) {
+        let line = format!("work {secs}");
+        self.tmux().type_text(&line).unwrap();
+        self.tmux().enter().unwrap();
+        self.wait_for(
+            || self.prompts(id).contains(&line),
+            "the busy turn to start",
+        );
+    }
+    fn wait_for(&self, mut ok: impl FnMut() -> bool, what: &str) {
+        for _ in 0..200 {
+            if ok() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("timed out waiting for {what}");
+    }
     /// Kill the core's command, leaving the pane at its shell.
     fn kill_command(&self) {
         let pane = self.tmux().pane().expect("pane");
@@ -684,6 +714,7 @@ fn fixture(
         calls: 1,
         usage: u,
         first: Some(u),
+        same_turn: false,
     }
 }
 
@@ -696,6 +727,7 @@ fn usage_summary_from_fixtures() {
         fixture("2026-11-04T12:00:00Z", "wake", Some(7000.0), 0, 9400, 400),
         fixture("2026-11-04T12:50:00Z", "ping", Some(3000.0), 9400, 0, 1),
         UsageEntry {
+            same_turn: false,
             reply: false,
             first: None,
             ..fixture("2026-11-04T15:00:00Z", "wake", Some(7800.0), 0, 0, 0)
@@ -733,4 +765,140 @@ fn usage_summary_from_fixtures() {
         .collect();
     fs::write(dir.join("usage.jsonl"), text).unwrap();
     assert_eq!(mem.core_usage(Utc::now()).unwrap(), entries);
+}
+
+// Brief 06: behaviour seen on real Claude Code 2.1.319 (haiku), mirrored by
+// the fake core.
+
+/// A wake typed while the core is busy is queued, joins the busy turn at its
+/// next tool call (not as a new prompt), and a second event in the same turn
+/// wakes exactly once more. That turn is the reply both wakes are counted
+/// against, once.
+#[test]
+fn wakes_while_busy_join_the_turn_once_each() {
+    let Some(w) = world("") else { return };
+    let id = started_id(w.mem.core_start(false).unwrap());
+    w.busy(&id, 4);
+    w.overlap("s1", "s2", "devices/kiln-east/ip");
+    let r = w.mem.watch_pass(Utc::now()).unwrap();
+    assert!(
+        matches!(
+            r.wake,
+            WakeOutcome::Woken {
+                events: 1,
+                upto: 1,
+                confirmed: true
+            }
+        ),
+        "{:?}",
+        r.wake
+    );
+    assert_eq!(
+        w.mem.watch_pass(Utc::now()).unwrap().wake,
+        WakeOutcome::AwaitingAck { events: 1 }
+    );
+    // A second event in the same busy turn: one more wake, then none.
+    w.overlap("s3", "s4", "devices/press-02/ip");
+    let r = w.mem.watch_pass(Utc::now()).unwrap();
+    assert!(
+        matches!(
+            r.wake,
+            WakeOutcome::Woken {
+                events: 2,
+                upto: 2,
+                confirmed: true
+            }
+        ),
+        "{:?}",
+        r.wake
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            w.mem.watch_pass(Utc::now()).unwrap().wake,
+            WakeOutcome::AwaitingAck { events: 2 }
+        );
+    }
+    w.wait_for(|| w.absorbed(&id).len() == 2, "both wakes to join the turn");
+    w.wait_for(
+        || w.mem.core_usage(Utc::now()).unwrap().len() == 2,
+        "the busy turn to end",
+    );
+    assert_eq!(
+        w.absorbed(&id),
+        vec![
+            "[WAKE] 1 event, up to #1: run mem core context",
+            "[WAKE] 2 events, up to #2: run mem core context"
+        ]
+    );
+    // Neither became a prompt of its own; nothing was lost or doubled.
+    assert!(w.wakes(&id).is_empty());
+    assert_eq!(w.mem.core_context(Utc::now()).unwrap().events.len(), 2);
+    assert_eq!(w.mem.core_ack(None, Utc::now()).unwrap(), (2, 0));
+
+    // Usage: the busy turn (tool calls and all) is the first wake's reply;
+    // the second wake is marked as the same turn and not counted twice.
+    let u = w.mem.core_usage(Utc::now()).unwrap();
+    assert!(u[0].reply && !u[0].same_turn);
+    assert!(u[0].calls >= 3, "{:?}", u[0]);
+    assert!(u[1].reply && u[1].same_turn && u[1].calls == 0);
+    let rows = summarize_usage(&u);
+    assert_eq!(rows.iter().map(|r| r.count).sum::<usize>(), 1);
+    // A later prompt is not mistaken for either wake's reply.
+    w.tmux().type_text("hello core").unwrap();
+    w.tmux().enter().unwrap();
+    w.wait_for(
+        || w.prompts(&id).contains(&"hello core".to_string()),
+        "the prompt",
+    );
+    assert_eq!(w.mem.core_usage(Utc::now()).unwrap().len(), 2);
+}
+
+/// Killed (SIGKILL) mid-turn, after a wake joined the turn but before the
+/// ack: the event stays pending, the watchdog resumes the pinned session in
+/// a pane it can type into, and the restored session is woken once more.
+#[test]
+fn a_core_killed_mid_wake_is_woken_once_more() {
+    let Some(w) = world("") else { return };
+    let id = started_id(w.mem.core_start(false).unwrap());
+    w.busy(&id, 30);
+    w.overlap("s1", "s2", "devices/kiln-east/ip");
+    let r = w.mem.watch_pass(Utc::now()).unwrap();
+    assert!(
+        matches!(r.wake, WakeOutcome::Woken { upto: 1, .. }),
+        "{:?}",
+        r.wake
+    );
+    w.wait_for(|| w.absorbed(&id).len() == 1, "the wake to join the turn");
+    w.kill_command();
+
+    let r = w.mem.watch_pass(Utc::now()).unwrap();
+    assert!(
+        r.core.iter().any(|n| n.contains("restored")),
+        "{:?}",
+        r.core
+    );
+    assert!(
+        matches!(
+            r.wake,
+            WakeOutcome::Woken {
+                events: 1,
+                upto: 1,
+                confirmed: true
+            }
+        ),
+        "{:?}",
+        r.wake
+    );
+    assert_eq!(w.starts().last().unwrap(), &format!("args: --resume {id}"));
+    assert_eq!(
+        w.mem.watch_pass(Utc::now()).unwrap().wake,
+        WakeOutcome::AwaitingAck { events: 1 }
+    );
+    // Once in the dead turn, once as a prompt to the restored session.
+    assert_eq!(w.absorbed(&id).len(), 1);
+    assert_eq!(
+        w.wakes(&id),
+        vec!["[WAKE] 1 event, up to #1: run mem core context"]
+    );
+    assert_eq!(w.mem.core_ack(None, Utc::now()).unwrap(), (1, 0));
 }
