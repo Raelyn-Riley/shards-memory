@@ -13,9 +13,9 @@ use shards_core::coresession::summarize_usage;
 use shards_core::coresession::Landed;
 use shards_core::shardsession::ShardLaunch;
 use shards_core::{
-    resolve, sample, Address, CoreStatus, DinitReport, Memory, NewQuirk, PassReport, Provenance,
-    Quirk, QuirkState, ResolveOptions, ShardMeta, ShardStart, Side, StartReport, Take, UsageEntry,
-    WakeOutcome,
+    resolve, sample, Address, CoreStatus, DinitReport, Memory, NewQuirk, Owner, PassReport,
+    Provenance, Quirk, QuirkState, Rank, ResolveOptions, ShardMeta, ShardStart, Side, StartReport,
+    Take, UsageEntry, WakeOutcome,
 };
 
 #[derive(Parser)]
@@ -92,13 +92,17 @@ enum Cmd {
         seed: u64,
     },
     /// Write a notes/, people/ or soul/ markdown file (a soul change on main
-    /// needs an admin --human).
+    /// needs an admin --human). With --for, the note goes in notes/<person>/.
     Put {
         path: String,
         /// File to read the contents from; `-` or omitted reads stdin.
         file: Option<PathBuf>,
         #[arg(long)]
         why: String,
+        /// Whose note it is: writes notes/<person>/<file>. Without it, a
+        /// notes/<file>.md path is a shared note.
+        #[arg(long = "for", value_name = "PERSON")]
+        for_person: Option<String>,
         #[command(flatten)]
         who: Who,
     },
@@ -146,6 +150,9 @@ enum Cmd {
     /// The reasoning core's view.
     #[command(subcommand)]
     Core(CoreCmd),
+    /// Notes: shared ones at the top of notes/, a person's own in notes/<person>/.
+    #[command(subcommand)]
+    Notes(NotesCmd),
     /// Known quirks: what's weird about a tool right now. Written straight
     /// to main from any shard, visible to every shard at once.
     #[command(subcommand)]
@@ -332,6 +339,19 @@ enum QuirkCmd {
         by: Option<String>,
         #[arg(long, env = "SHARDS_AUTHOR")]
         author: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum NotesCmd {
+    /// Find notes containing a word: the person's own first, then shared
+    /// notes, then everyone else's. Notes are never facts.
+    Find {
+        word: String,
+        #[arg(long = "for", value_name = "PERSON")]
+        for_person: String,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -820,12 +840,39 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             path,
             file,
             why,
+            for_person,
             who,
         } => {
             let mem = Memory::open(&cli.memory)?;
             let text = read_input(file)?;
-            let commit = mem.put_file(&path, &text, &prov(who, why))?;
+            let person = given(for_person);
+            let (path, commit) =
+                mem.put_note_as(person.as_deref(), &path, &text, &prov(who, why))?;
             writeln!(out, "wrote {path} ({})", short(&commit))?;
+        }
+        Cmd::Notes(NotesCmd::Find {
+            word,
+            for_person,
+            json,
+        }) => {
+            let mem = Memory::open(&cli.memory)?;
+            let hits = mem.find_notes(&word, &for_person)?;
+            if json {
+                writeln!(out, "{}", serde_json::to_string_pretty(&hits)?)?;
+            } else if hits.is_empty() {
+                writeln!(out, "no notes mention {word:?}")?;
+            }
+            for h in hits.iter().filter(|_| !json) {
+                let whose = match &h.owner {
+                    Owner::Shared => "shared note".to_string(),
+                    Owner::Person(p) if h.rank == Rank::Own => format!("{p}'s own note"),
+                    Owner::Person(p) => format!("{p}'s note"),
+                };
+                writeln!(out, "{}  ({whose}, {})", h.path, h.day())?;
+                for l in &h.lines {
+                    writeln!(out, "    {l}")?;
+                }
+            }
         }
         Cmd::Shard(ShardCmd::Open { id, human }) => {
             let mem = Memory::open(&cli.memory)?;
