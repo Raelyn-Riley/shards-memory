@@ -314,3 +314,31 @@ fn killed_holder_is_recovered_after_the_lease_and_logged() {
     fsck(&m);
     no_lock_files_left(&m);
 }
+
+/// Brief 09: the lock timeout read from `[intervals]`, which wins over an old
+/// `[lock] timeout_secs` in the same file.
+#[test]
+fn the_lock_timeout_in_intervals_wins_over_the_old_place() {
+    let (_t, m) = setup("");
+    let w: &[&str] = &["supersede", "devices/ctl/port", "1", "--why", "w"];
+    write_config(
+        &m,
+        "[lock]\nwhen_busy = \"wait\"\ntimeout_secs = 60\n[intervals]\nlock_timeout_secs = 1\n",
+    );
+    let mut holder = hold_lock(&m, 3.0);
+    let t0 = Instant::now();
+    let o = run(&m, w);
+    let waited = t0.elapsed();
+    assert!(!o.status.success());
+    assert!(stderr(&o).contains("gave up waiting"), "{}", stderr(&o));
+    assert!(waited >= Duration::from_millis(900), "{waited:?}");
+    assert!(waited < Duration::from_millis(2500), "{waited:?}");
+    holder.wait().unwrap();
+
+    // The old place alone still works: a long wait outlasts the holder.
+    write_config(&m, "[lock]\nwhen_busy = \"wait\"\ntimeout_secs = 20\n");
+    let mut holder = hold_lock(&m, 1.5);
+    ok(&run(&m, w));
+    holder.wait().unwrap();
+    assert_eq!(get(&m, "devices/ctl/port"), "1");
+}

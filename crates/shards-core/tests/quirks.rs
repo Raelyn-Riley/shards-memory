@@ -352,3 +352,23 @@ fn archive_days_come_from_config() {
     let mem = Memory::open_with_env(mem.root(), env()).unwrap();
     assert_eq!(mem.config().quirks.archive_after_days, 7.0);
 }
+
+#[test]
+fn archive_days_default_to_90_and_intervals_win() {
+    let (_t, mem) = fresh();
+    assert_eq!(mem.config().quirks.archive_after_days, 90.0);
+    std::fs::write(
+        mem.root().join("shards.toml"),
+        "[quirks]\narchive_after_days = 7\n[intervals]\nquirk_archive_days = 14\n",
+    )
+    .unwrap();
+    let mem = Memory::open_with_env(mem.root(), env()).unwrap();
+    assert_eq!(mem.config().quirks.archive_after_days, 14.0);
+    std::fs::write(
+        mem.root().join("shards.toml"),
+        "[intervals]\nquirk_archive_days = 21\n",
+    )
+    .unwrap();
+    let mem = Memory::open_with_env(mem.root(), env()).unwrap();
+    assert_eq!(mem.config().quirks.archive_after_days, 21.0);
+}
