@@ -718,7 +718,7 @@ fn print_quirk(out: &mut impl Write, q: &Quirk) -> io::Result<()> {
 }
 
 /// Quirk writes go to main even from a shard's pane, whose SHARDS_MEMORY is
-/// the main root; with no --author, the pane's SHARDS_SHARD is the author.
+/// its worktree; with no --author, the pane's SHARDS_SHARD is the author.
 fn qprov(author: Option<String>) -> Provenance {
     let author = author
         .filter(|a| !a.trim().is_empty())
@@ -728,7 +728,12 @@ fn qprov(author: Option<String>) -> Provenance {
 }
 
 fn prov(who: Who, why: String) -> Provenance {
-    Provenance::new(who.author.unwrap_or_default(), who.human, why)
+    Provenance::new(who.author.unwrap_or_default(), given(who.human), why)
+}
+
+/// An empty value (a shard's pane clears `SHARDS_HUMAN`) is no value.
+fn given(v: Option<String>) -> Option<String> {
+    v.filter(|s| !s.trim().is_empty())
 }
 
 fn read_input(file: Option<PathBuf>) -> io::Result<String> {
@@ -824,7 +829,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Cmd::Shard(ShardCmd::Open { id, human }) => {
             let mem = Memory::open(&cli.memory)?;
-            let meta = mem.shard_open(&id, human.as_deref())?;
+            let meta = mem.shard_open(&id, given(human).as_deref())?;
             writeln!(out, "{}", meta.worktree.display())?;
             eprintln!(
                 "mem: opened shard {id} on {} from main at {}",
@@ -834,6 +839,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Cmd::Shard(ShardCmd::Start { id, human, resume }) => {
             let mem = Memory::open(&cli.memory)?;
+            let human = given(human);
             match mem.shard_start(id.as_deref(), human.as_deref(), resume, ShardLaunch::Blank)? {
                 ShardStart::AlreadyRunning { meta } => writeln!(
                     out,
@@ -992,7 +998,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             why,
         }) => {
             let mem = Memory::open(&cli.memory)?;
-            let p = Provenance::new(author.unwrap_or_default(), human, why);
+            let p = Provenance::new(author.unwrap_or_default(), given(human), why);
             let commit = mem.soul_approve(&shard, &p)?;
             writeln!(
                 out,
