@@ -70,6 +70,12 @@ pub enum Error {
     #[error("`{path}` can't be written with `mem put`: {reason}")]
     BadPath { path: String, reason: String },
 
+    #[error("no quirk `{0}` (ids look like q3; see `mem quirk list --all`)")]
+    UnknownQuirk(String),
+
+    #[error("quirk: {0}")]
+    BadQuirk(String),
+
     #[error("lock `{name}` is busy: {msg}")]
     Locked { name: String, msg: String },
 

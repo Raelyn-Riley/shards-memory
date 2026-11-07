@@ -58,6 +58,9 @@
 //! keep_warm = false
 //! keep_warm_mins = 50
 //! keep_warm_quiet_limit = 8
+//!
+//! [quirks]
+//! archive_after_days = 30  # `mem quirk archive`: fixed and not mentioned this long
 //! ```
 
 use std::path::Path;
@@ -360,6 +363,22 @@ impl CoreConfig {
     }
 }
 
+/// The known-quirks board.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct QuirksConfig {
+    /// `mem quirk archive` archives fixed quirks not mentioned for this long.
+    pub archive_after_days: f64,
+}
+
+impl Default for QuirksConfig {
+    fn default() -> Self {
+        QuirksConfig {
+            archive_after_days: 30.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -371,6 +390,7 @@ pub struct Config {
     pub triggers: TriggersConfig,
     pub wake: WakeConfig,
     pub core: CoreConfig,
+    pub quirks: QuirksConfig,
 }
 
 impl Config {
@@ -508,5 +528,20 @@ mod tests {
         assert_eq!(c.core.adapter, AdapterKind::Plain);
         assert!(Config::parse("[wake]\nmode = \"tty\"\n").is_err());
         assert!(Config::parse("[core]\nkeepwarm = true\n").is_err());
+    }
+
+    #[test]
+    fn quirks_section() {
+        assert_eq!(Config::parse("").unwrap().quirks.archive_after_days, 30.0);
+        assert_eq!(
+            Config::parse(DEFAULT_TOML)
+                .unwrap()
+                .quirks
+                .archive_after_days,
+            30.0
+        );
+        let c = Config::parse("[quirks]\narchive_after_days = 7\n").unwrap();
+        assert_eq!(c.quirks.archive_after_days, 7.0);
+        assert!(Config::parse("[quirks]\narchive_days = 7\n").is_err());
     }
 }
