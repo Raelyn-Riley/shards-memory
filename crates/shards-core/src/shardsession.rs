@@ -215,6 +215,31 @@ pub fn one_line(text: &str) -> String {
     paras.join(" | ").trim().to_string()
 }
 
+/// The environment a shard's pane gives its shell and agent, on top of what
+/// the shards tmux server inherited.
+///
+/// - `SHARDS_MEMORY` is the shard's **worktree**, not the main root, so
+///   `mem set`, `supersede` and `put` commit to `shard/<id>` and reads show
+///   the shard's own branch. Commands that need main (`dinit`, `board`,
+///   `shard ...`, `core ...`, `quirk ...`) find it from the worktree.
+/// - `SHARDS_AUTHOR` is the shard id and `SHARDS_HUMAN` is cleared, so a
+///   value inherited from whoever started the server can't stand in for
+///   them: a write in the worktree is stamped with the shard and the
+///   shard's own human from its record.
+pub fn shard_pane_env(meta: &ShardMeta) -> Vec<(String, String)> {
+    vec![
+        (
+            "SHARDS_MEMORY".to_string(),
+            meta.worktree.to_string_lossy().into_owned(),
+        ),
+        ("SHARDS_SHARD".to_string(), meta.id.clone()),
+        ("SHARDS_AUTHOR".to_string(), meta.id.clone()),
+        ("SHARDS_HUMAN".to_string(), String::new()),
+        ("PS1".to_string(), PS1.to_string()),
+        ("ENV".to_string(), String::new()),
+    ]
+}
+
 impl Memory {
     fn shard_pane(&self, meta: &ShardMeta) -> Result<ShardPane> {
         let main = self.main()?;
@@ -232,15 +257,7 @@ impl Memory {
             pane: PaneRunner {
                 tmux: Tmux::new(socket, tmux_name(&meta.id)),
                 cwd: meta.worktree.clone(),
-                env: vec![
-                    (
-                        "SHARDS_MEMORY".to_string(),
-                        root.to_string_lossy().into_owned(),
-                    ),
-                    ("SHARDS_SHARD".to_string(), meta.id.clone()),
-                    ("PS1".to_string(), PS1.to_string()),
-                    ("ENV".to_string(), String::new()),
-                ],
+                env: shard_pane_env(meta),
                 ps1: PS1.to_string(),
                 start_timeout: cfg.core.start_timeout(),
                 exit_timeout: cfg.core.exit_timeout(),
