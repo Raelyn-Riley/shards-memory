@@ -491,14 +491,27 @@ impl Config {
     }
 }
 
-/// The file `mem init` writes.
+/// The file `mem init` writes: every duration in `[intervals]`, none in the
+/// old places (which are still read, for older files).
 pub const DEFAULT_TOML: &str = r#"# shards configuration. Edit freely; no code changes needed.
+
+[intervals]                   # every duration, in one place
+lock_timeout_secs = 30        # "wait": how long a writer queues for a lock
+lock_lease_secs = 30          # a lock not renewed for this long, whose process is gone, is recovered
+idle_secs = 600               # no shard activity for this long: idle
+stale_secs = 3600             # no shard activity for this long: stale
+watch_poll_secs = 30          # how often `mem watch` looks
+wake_timeout_secs = 300       # how long a wake command may run
+core_cooldown_secs = 0        # wake the core at most once per this long; 0: no rate limit
+core_start_timeout_secs = 60  # a core/shard session coming up and pinning
+core_exit_timeout_secs = 30   # a core/shard session exiting when told to
+core_land_timeout_secs = 10   # a typed line showing in the pane / transcript
+keep_warm_mins = 50           # keep-warm ping after this long idle
+quirk_archive_days = 90       # `mem quirk archive`: fixed and not mentioned for this long
 
 [lock]
 scope = "store"        # "store" (one lock for main) | "section" (one per top-level section)
-when_busy = "wait"     # "wait" (queue up to timeout_secs) | "fail" (fail fast)
-timeout_secs = 30
-lease_secs = 30        # a lock not renewed for this long, whose process is gone, is recovered
+when_busy = "wait"     # "wait" (queue up to lock_timeout_secs) | "fail" (fail fast)
 
 [soul]
 admins = []            # humans allowed to approve soul changes, e.g. ["Ada"]
@@ -515,11 +528,6 @@ claude_config = ""     # empty: ~/.claude.json (read to check the memory root is
 source = "claude-code" # "claude-code" (read session transcripts) | "none" (git only)
 transcript_dir = ""    # empty: ~/.claude/projects (or $CLAUDE_CONFIG_DIR/projects)
 
-[awareness]
-idle_secs = 600        # no activity for this long: idle
-stale_secs = 3600      # no activity for this long: stale
-poll_secs = 30         # how often `mem watch` looks
-
 [triggers]
 same_fact = true        # two open shards have the same fact in flight
 same_section = false    # two open shards are in flight in the same section
@@ -530,8 +538,6 @@ soul_proposal = true    # a soul proposal waits for an admin
 [wake]
 mode = "auto"          # "auto": "pane" once `mem core start` has run, else "command" | "command" | "pane"
 command = ""           # command mode: run this (sh -c, events as JSON on stdin); empty: record only
-timeout_secs = 300
-cooldown_secs = 0      # wake the core at most once per this long; 0: no rate limit
 
 [core]                 # the reasoning core: one long-lived session in a tmux pane
 command = "claude"     # typed into the pane's shell by `mem core start`
@@ -540,11 +546,7 @@ socket = ".shards/core/tmux.sock"  # its own tmux server
 session = "core"
 cwd = ""               # empty: the memory root
 watchdog = true        # mem watch restores a dead core and resumes its pinned session
-start_timeout_secs = 60
-exit_timeout_secs = 30
-land_timeout_secs = 10
 keep_warm = false      # ping an idle core to keep its prompt cache warm (for measuring)
-keep_warm_mins = 50
 keep_warm_quiet_limit = 8  # stop after this many pings with no real activity
 "#;
 
@@ -692,5 +694,66 @@ mod tests {
         // A typo in [intervals] is an error, like everywhere else.
         assert!(Config::parse("[intervals]\nquirk_archive_day = 1\n").is_err());
         assert!(Config::parse("[intervals]\nkeep_warm_quiet_limit = 1\n").is_err());
+    }
+
+    /// Brief 10: `mem init` writes every duration in `[intervals]` and none
+    /// in an old place, with the same values as no file at all.
+    #[test]
+    fn default_file_has_every_duration_in_intervals() {
+        let t: toml::Table = toml::from_str(DEFAULT_TOML).unwrap();
+        let i = t["intervals"].as_table().unwrap();
+        for k in [
+            "lock_timeout_secs",
+            "lock_lease_secs",
+            "idle_secs",
+            "stale_secs",
+            "watch_poll_secs",
+            "wake_timeout_secs",
+            "core_cooldown_secs",
+            "core_start_timeout_secs",
+            "core_exit_timeout_secs",
+            "core_land_timeout_secs",
+            "keep_warm_mins",
+            "quirk_archive_days",
+        ] {
+            assert!(i.contains_key(k), "[intervals] {k} missing");
+        }
+        assert_eq!(i.len(), 12);
+        let old = [
+            ("lock", "timeout_secs"),
+            ("lock", "lease_secs"),
+            ("wake", "timeout_secs"),
+            ("wake", "cooldown_secs"),
+            ("core", "start_timeout_secs"),
+            ("core", "exit_timeout_secs"),
+            ("core", "land_timeout_secs"),
+            ("core", "keep_warm_mins"),
+        ];
+        for (sec, k) in old {
+            assert!(!t[sec].as_table().unwrap().contains_key(k), "[{sec}] {k}");
+        }
+        assert!(!t.contains_key("awareness") && !t.contains_key("quirks"));
+        let (d, e) = (
+            Config::parse(DEFAULT_TOML).unwrap(),
+            Config::parse("").unwrap(),
+        );
+        let vals = |c: &Config| {
+            let i = &c.intervals;
+            [
+                i.lock_timeout_secs,
+                i.lock_lease_secs,
+                i.idle_secs,
+                i.stale_secs,
+                i.watch_poll_secs,
+                i.wake_timeout_secs,
+                i.core_cooldown_secs,
+                i.core_start_timeout_secs,
+                i.core_exit_timeout_secs,
+                i.core_land_timeout_secs,
+                i.keep_warm_mins,
+                i.quirk_archive_days,
+            ]
+        };
+        assert_eq!(vals(&d), vals(&e));
     }
 }
