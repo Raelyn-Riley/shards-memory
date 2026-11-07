@@ -161,15 +161,7 @@ impl Tmux {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        // Set through `env` in the pane's command: tmux's `-e` doesn't reach
-        // every variable (dash resets PS1 from it).
-        let mut line = String::from("exec env");
-        for (k, v) in env {
-            line.push(' ');
-            line.push_str(&crate::coreadapter::shell_quote(&format!("{k}={v}")));
-        }
-        line.push_str(" /bin/sh");
-        args.push(line);
+        args.push(shell_line(env));
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         if !self.server_running() && self.new_server_in_scope(&refs) && self.has_session() {
             // Started in its own scope.
@@ -180,6 +172,26 @@ impl Tmux {
         let _ = self.run(&["set-option", "-t", &self.target(), "remain-on-exit", "on"]);
         let _ = self.run(&["set-option", "-t", &self.target(), "history-limit", "5000"]);
         Ok(())
+    }
+
+    /// Replace the pane's shell (and anything it runs) with a fresh one in
+    /// `cwd`. A command that was killed can leave the terminal raw (no echo,
+    /// no line editing, Enter not a newline) and on its alternate screen,
+    /// and its shell may already hold half-typed input; a new shell on a
+    /// reset pane has none of that. The pane, and anyone attached, stay.
+    pub fn respawn(&self, cwd: &Path, env: &[(String, String)]) -> Result<()> {
+        let cwd = cwd.to_string_lossy();
+        let line = shell_line(env);
+        self.run(&[
+            "respawn-pane",
+            "-k",
+            "-t",
+            &self.target(),
+            "-c",
+            &cwd,
+            &line,
+        ])
+        .map(|_| ())
     }
 
     /// The first pane of the session, if any.
@@ -255,6 +267,19 @@ impl Tmux {
             self.target(),
         ]
     }
+}
+
+/// The pane's command: `/bin/sh` with `env` set. Set through `env` in the
+/// command because tmux's `-e` doesn't reach every variable (dash resets
+/// PS1 from it).
+fn shell_line(env: &[(String, String)]) -> String {
+    let mut line = String::from("exec env");
+    for (k, v) in env {
+        line.push(' ');
+        line.push_str(&crate::coreadapter::shell_quote(&format!("{k}={v}")));
+    }
+    line.push_str(" /bin/sh");
+    line
 }
 
 /// Child processes of `pid` (Linux `/proc`; elsewhere `ps`).

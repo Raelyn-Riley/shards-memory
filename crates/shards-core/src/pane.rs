@@ -48,15 +48,17 @@ impl PaneRunner {
         }
     }
 
-    /// A pane with a live shell, creating it if needed. A pane whose shell
-    /// died is replaced.
+    /// A pane at a fresh shell, ready for a launch line, creating it if
+    /// needed. Leaves a running command alone. A pane that is back at its
+    /// shell, or whose shell died, gets a new shell: a command that was
+    /// killed (rather than told to exit) leaves the terminal raw, and the
+    /// old shell can't be typed into reliably.
     pub fn ensure_pane(&self) -> Result<()> {
         match self.tmux.pane() {
-            Some(p) if !p.dead => return Ok(()),
-            Some(_) => self.tmux.kill_session(),
-            None => {}
+            Some(p) if !p.dead && !tmux::children(p.pid).is_empty() => return Ok(()),
+            Some(_) => self.tmux.respawn(&self.cwd, &self.env)?,
+            None => self.tmux.new_session(&self.cwd, &self.env)?,
         }
-        self.tmux.new_session(&self.cwd, &self.env)?;
         if !self.tmux.wait_for_text(&self.ps1, Duration::from_secs(5)) {
             return Err(Error::Core("the pane's shell did not come up".into()));
         }

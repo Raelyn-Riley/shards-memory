@@ -1041,7 +1041,11 @@ impl Memory {
             )));
         }
         // 4-6. Start the new session, deliver the baton, pin its id.
-        match c.launch_fresh(Some(baton), old.as_deref()) {
+        match c
+            .pane
+            .ensure_pane()
+            .and_then(|_| c.launch_fresh(Some(baton), old.as_deref()))
+        {
             Ok(new) => {
                 if let Some(o) = old {
                     pin.previous.push(o);
@@ -1070,10 +1074,10 @@ impl Memory {
             Err(e) => {
                 c.log(&format!("rinit: FAILED starting the new session: {e}"));
                 c.pane.kill_command();
-                let back = match old.as_deref() {
+                let back = c.pane.ensure_pane().and_then(|_| match old.as_deref() {
                     Some(id) => c.launch_resume(id),
                     None => c.launch_fresh(None, None).map(|_| ()),
-                };
+                });
                 match back {
                     Ok(()) => {
                         c.log(&format!("rinit: old session {oldname} resumed"));
