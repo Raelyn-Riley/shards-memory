@@ -5,12 +5,30 @@
 //! (and every table and key in it) is optional. Unknown keys are an error, so
 //! a typo can't silently fall back to a default.
 //!
+//! Every duration lives in one `[intervals]` section. The same settings are
+//! still read from their old sections (`[lock] timeout_secs`, `[core]
+//! keep_warm_mins`, `[quirks] archive_after_days`, ...), so an older
+//! `shards.toml` keeps working. When a setting is in both places,
+//! `[intervals]` wins.
+//!
 //! ```toml
+//! [intervals]
+//! lock_timeout_secs = 30        # how long a waiting writer waits for a lock
+//! lock_lease_secs = 30          # lock lifetime without a heartbeat
+//! idle_secs = 600               # no shard activity this long: idle
+//! stale_secs = 3600             # no shard activity this long: stale
+//! watch_poll_secs = 30          # how often `mem watch` runs a pass
+//! wake_timeout_secs = 300       # how long a wake command may run
+//! core_cooldown_secs = 0        # wake the core at most once per this long; 0: no limit
+//! core_start_timeout_secs = 60  # a core/shard session coming up and pinning
+//! core_exit_timeout_secs = 30   # a core/shard session exiting when told to
+//! core_land_timeout_secs = 10   # a typed line showing in the pane / transcript
+//! keep_warm_mins = 50           # keep-warm ping after this long idle
+//! quirk_archive_days = 90       # `mem quirk archive`: fixed and not mentioned this long
+//!
 //! [lock]
 //! scope = "store"        # "store" | "section"
 //! when_busy = "wait"     # "wait" | "fail"
-//! timeout_secs = 30      # how long a waiting writer waits
-//! lease_secs = 30        # lock lifetime without a heartbeat
 //!
 //! [soul]
 //! admins = ["Ada"]       # humans who may approve soul changes
@@ -27,11 +45,6 @@
 //! source = "claude-code" # "claude-code" | "none"
 //! transcript_dir = ""    # default: $CLAUDE_CONFIG_DIR/projects or ~/.claude/projects
 //!
-//! [awareness]
-//! idle_secs = 600        # no activity this long: idle
-//! stale_secs = 3600      # no activity this long: stale
-//! poll_secs = 30         # how often `mem watch` runs a pass
-//!
 //! [triggers]
 //! same_fact = true
 //! same_section = false
@@ -42,8 +55,6 @@
 //! [wake]
 //! mode = "auto"          # "auto" | "command" | "pane"
 //! command = ""           # empty: record events, run nothing
-//! timeout_secs = 300
-//! cooldown_secs = 0      # at most one wake per this long; 0: no limit
 //!
 //! [core]
 //! command = "claude"     # the reasoning core, run in a tmux pane
@@ -52,16 +63,29 @@
 //! session = "core"
 //! cwd = ""               # empty: the memory root
 //! watchdog = true        # mem watch restores a dead core
-//! start_timeout_secs = 60
-//! exit_timeout_secs = 30
-//! land_timeout_secs = 10
 //! keep_warm = false
-//! keep_warm_mins = 50
-//! keep_warm_quiet_limit = 8
-//!
-//! [quirks]
-//! archive_after_days = 30  # `mem quirk archive`: fixed and not mentioned this long
+//! keep_warm_quiet_limit = 8  # a count, not a duration: stays in [core]
 //! ```
+//!
+//! Old places, still read (`[intervals]` wins):
+//!
+//! | `[intervals]` | old place |
+//! |---|---|
+//! | `lock_timeout_secs` | `[lock] timeout_secs` |
+//! | `lock_lease_secs` | `[lock] lease_secs` |
+//! | `idle_secs` | `[awareness] idle_secs` |
+//! | `stale_secs` | `[awareness] stale_secs` |
+//! | `watch_poll_secs` | `[awareness] poll_secs` |
+//! | `wake_timeout_secs` | `[wake] timeout_secs` |
+//! | `core_cooldown_secs` | `[wake] cooldown_secs` |
+//! | `core_start_timeout_secs` | `[core] start_timeout_secs` |
+//! | `core_exit_timeout_secs` | `[core] exit_timeout_secs` |
+//! | `core_land_timeout_secs` | `[core] land_timeout_secs` |
+//! | `keep_warm_mins` | `[core] keep_warm_mins` |
+//! | `quirk_archive_days` | `[quirks] archive_after_days` |
+//!
+//! After loading, the resolved values sit in the old section structs too
+//! (`cfg.lock.timeout_secs`, ...), so the code reading them is unchanged.
 
 use std::path::Path;
 use std::time::Duration;
@@ -374,7 +398,7 @@ pub struct QuirksConfig {
 impl Default for QuirksConfig {
     fn default() -> Self {
         QuirksConfig {
-            archive_after_days: 30.0,
+            archive_after_days: 90.0,
         }
     }
 }
@@ -391,6 +415,27 @@ pub struct Config {
     pub wake: WakeConfig,
     pub core: CoreConfig,
     pub quirks: QuirksConfig,
+    /// Every duration in one place; see the module docs.
+    pub intervals: IntervalsConfig,
+}
+
+/// `[intervals]`: every duration. A key left out falls back to its old place
+/// (or that place's default).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IntervalsConfig {
+    pub lock_timeout_secs: Option<f64>,
+    pub lock_lease_secs: Option<f64>,
+    pub idle_secs: Option<f64>,
+    pub stale_secs: Option<f64>,
+    pub watch_poll_secs: Option<f64>,
+    pub wake_timeout_secs: Option<f64>,
+    pub core_cooldown_secs: Option<f64>,
+    pub core_start_timeout_secs: Option<f64>,
+    pub core_exit_timeout_secs: Option<f64>,
+    pub core_land_timeout_secs: Option<f64>,
+    pub keep_warm_mins: Option<f64>,
+    pub quirk_archive_days: Option<f64>,
 }
 
 impl Config {
@@ -399,13 +444,50 @@ impl Config {
         let path = root.join(FILE);
         match std::fs::read_to_string(&path) {
             Ok(text) => Config::parse(&text),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::parse(""),
             Err(e) => Err(e.into()),
         }
     }
 
     pub fn parse(text: &str) -> Result<Config> {
-        toml::from_str(text).map_err(|e| Error::Config(e.to_string()))
+        let mut c: Config = toml::from_str(text).map_err(|e| Error::Config(e.to_string()))?;
+        c.resolve_intervals();
+        Ok(c)
+    }
+
+    /// `[intervals]` wins over the old places; afterwards both agree.
+    fn resolve_intervals(&mut self) {
+        fn pick(new: &mut Option<f64>, old: &mut f64) {
+            match *new {
+                Some(v) => *old = v,
+                None => *new = Some(*old),
+            }
+        }
+        let i = &mut self.intervals;
+        pick(&mut i.lock_timeout_secs, &mut self.lock.timeout_secs);
+        pick(&mut i.lock_lease_secs, &mut self.lock.lease_secs);
+        pick(&mut i.idle_secs, &mut self.awareness.idle_secs);
+        pick(&mut i.stale_secs, &mut self.awareness.stale_secs);
+        pick(&mut i.watch_poll_secs, &mut self.awareness.poll_secs);
+        pick(&mut i.wake_timeout_secs, &mut self.wake.timeout_secs);
+        pick(&mut i.core_cooldown_secs, &mut self.wake.cooldown_secs);
+        pick(
+            &mut i.core_start_timeout_secs,
+            &mut self.core.start_timeout_secs,
+        );
+        pick(
+            &mut i.core_exit_timeout_secs,
+            &mut self.core.exit_timeout_secs,
+        );
+        pick(
+            &mut i.core_land_timeout_secs,
+            &mut self.core.land_timeout_secs,
+        );
+        pick(&mut i.keep_warm_mins, &mut self.core.keep_warm_mins);
+        pick(
+            &mut i.quirk_archive_days,
+            &mut self.quirks.archive_after_days,
+        );
     }
 }
 
@@ -532,16 +614,83 @@ mod tests {
 
     #[test]
     fn quirks_section() {
-        assert_eq!(Config::parse("").unwrap().quirks.archive_after_days, 30.0);
+        assert_eq!(Config::parse("").unwrap().quirks.archive_after_days, 90.0);
         assert_eq!(
             Config::parse(DEFAULT_TOML)
                 .unwrap()
                 .quirks
                 .archive_after_days,
-            30.0
+            90.0
         );
         let c = Config::parse("[quirks]\narchive_after_days = 7\n").unwrap();
         assert_eq!(c.quirks.archive_after_days, 7.0);
         assert!(Config::parse("[quirks]\narchive_days = 7\n").is_err());
+    }
+
+    #[test]
+    fn intervals_section() {
+        // Defaults, with no file and with an empty [intervals].
+        for text in ["", "[intervals]\n", DEFAULT_TOML] {
+            let c = Config::parse(text).unwrap();
+            assert_eq!(c.intervals.quirk_archive_days, Some(90.0));
+            assert_eq!(c.intervals.lock_timeout_secs, Some(30.0));
+            assert_eq!(c.intervals.watch_poll_secs, Some(30.0));
+            assert_eq!(c.intervals.keep_warm_mins, Some(50.0));
+            assert_eq!(c.intervals.core_cooldown_secs, Some(0.0));
+        }
+        // Every key in [intervals] lands where the code reads it.
+        let c = Config::parse(
+            "[intervals]\nlock_timeout_secs = 1\nlock_lease_secs = 2\nidle_secs = 3\n\
+             stale_secs = 4\nwatch_poll_secs = 5\nwake_timeout_secs = 6\n\
+             core_cooldown_secs = 7\ncore_start_timeout_secs = 8\n\
+             core_exit_timeout_secs = 9\ncore_land_timeout_secs = 10\n\
+             keep_warm_mins = 11\nquirk_archive_days = 12\n",
+        )
+        .unwrap();
+        let got = [
+            c.lock.timeout_secs,
+            c.lock.lease_secs,
+            c.awareness.idle_secs,
+            c.awareness.stale_secs,
+            c.awareness.poll_secs,
+            c.wake.timeout_secs,
+            c.wake.cooldown_secs,
+            c.core.start_timeout_secs,
+            c.core.exit_timeout_secs,
+            c.core.land_timeout_secs,
+            c.core.keep_warm_mins,
+            c.quirks.archive_after_days,
+        ];
+        assert_eq!(got, [1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12.]);
+        assert_eq!(c.lock.timeout(), Duration::from_secs(1));
+        assert_eq!(c.awareness.poll(), Duration::from_secs(5));
+        // Old places still work.
+        let old = Config::parse(
+            "[lock]\ntimeout_secs = 3\n[awareness]\npoll_secs = 4\n[wake]\ncooldown_secs = 5\n\
+             [core]\nkeep_warm_mins = 6\n[quirks]\narchive_after_days = 7\n",
+        )
+        .unwrap();
+        assert_eq!(old.lock.timeout_secs, 3.0);
+        assert_eq!(old.intervals.lock_timeout_secs, Some(3.0));
+        assert_eq!(old.awareness.poll_secs, 4.0);
+        assert_eq!(old.wake.cooldown_secs, 5.0);
+        assert_eq!(old.core.keep_warm_mins, 6.0);
+        assert_eq!(old.quirks.archive_after_days, 7.0);
+        assert_eq!(old.intervals.quirk_archive_days, Some(7.0));
+        // Both present: [intervals] wins, whichever comes first in the file.
+        for text in [
+            "[quirks]\narchive_after_days = 7\n[intervals]\nquirk_archive_days = 14\n",
+            "[intervals]\nquirk_archive_days = 14\n[quirks]\narchive_after_days = 7\n",
+        ] {
+            let c = Config::parse(text).unwrap();
+            assert_eq!(c.quirks.archive_after_days, 14.0);
+            assert_eq!(c.intervals.quirk_archive_days, Some(14.0));
+        }
+        let c =
+            Config::parse("[lock]\nlease_secs = 9\n[intervals]\nlock_lease_secs = 1\n").unwrap();
+        assert_eq!(c.lock.lease(), Duration::from_secs(1));
+        // A typo in [intervals] is an error, like everywhere else.
+        assert!(Config::parse("[intervals]\nquirk_archive_day = 1\n").is_err());
+        assert!(Config::parse("[intervals]\nkeep_warm_quiet_limit = 1\n").is_err());
     }
 }

@@ -137,7 +137,7 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Evaluate [triggers] every [awareness] poll_secs; wake the core when one fires.
+    /// Evaluate [triggers] every [intervals] watch_poll_secs; wake the core when one fires.
     Watch {
         /// Run one pass and exit (for a timer or cron).
         #[arg(long)]
@@ -325,7 +325,7 @@ enum QuirkCmd {
     /// Archive fixed quirks not mentioned for N days. Open quirks never archive;
     /// nothing is deleted.
     Archive {
-        /// Default: [quirks] archive_after_days in shards.toml (30).
+        /// Default: [intervals] quirk_archive_days in shards.toml (90).
         #[arg(long)]
         days: Option<f64>,
         #[arg(long, env = "SHARDS_HUMAN")]
