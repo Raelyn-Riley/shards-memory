@@ -717,8 +717,14 @@ fn print_quirk(out: &mut impl Write, q: &Quirk) -> io::Result<()> {
     Ok(())
 }
 
+/// Quirk writes go to main even from a shard's pane, whose SHARDS_MEMORY is
+/// the main root; with no --author, the pane's SHARDS_SHARD is the author.
 fn qprov(author: Option<String>) -> Provenance {
-    Provenance::new(author.unwrap_or_default(), None, "")
+    let author = author
+        .filter(|a| !a.trim().is_empty())
+        .or_else(|| std::env::var("SHARDS_SHARD").ok())
+        .unwrap_or_default();
+    Provenance::new(author, None, "")
 }
 
 fn prov(who: Who, why: String) -> Provenance {

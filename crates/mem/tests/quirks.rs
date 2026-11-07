@@ -18,6 +18,7 @@ fn cmd(dir: &Path, args: &[&str]) -> Command {
         .env_remove("SHARDS_MEMORY")
         .env_remove("SHARDS_HUMAN")
         .env_remove("SHARDS_AUTHOR")
+        .env_remove("SHARDS_SHARD")
         .env_remove("SHARDS_DEBUG_HOLD_MS")
         .stdin(Stdio::null());
     c
@@ -175,4 +176,29 @@ fn two_shards_adding_at_the_same_moment_lose_nothing() {
         .collect();
     assert_eq!(ids.len(), 12, "{json}");
     assert!((1..=12).all(|n| ids.contains(&format!("q{n}"))));
+}
+
+#[test]
+fn in_a_shard_pane_the_author_is_the_shard() {
+    // A shard's pane points SHARDS_MEMORY at the main root and sets SHARDS_SHARD.
+    let (_t, m, _a, _b) = setup();
+    let o = cmd(
+        &m,
+        &[
+            "quirk",
+            "add",
+            "--tool",
+            "jointer",
+            "--quirk",
+            "fence creeps",
+            "--by",
+            "Bob",
+        ],
+    )
+    .env("SHARDS_SHARD", "s1")
+    .output()
+    .unwrap();
+    ok(&o);
+    let h = ok(&run(&m, &["quirk", "history", "q1"]));
+    assert!(h.contains("by Bob (via s1)"), "{h}");
 }
