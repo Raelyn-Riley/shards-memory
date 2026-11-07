@@ -11,6 +11,8 @@
 //! from `shards_core::sample`, so no model is called. `mem` is then run with
 //! that environment and nothing else, in the pane's directory. One test runs
 //! `mem dinit` inside the pane itself. Without tmux the tests pass with a note.
+//!
+//! Brief 09 adds notes with owners and `[intervals]`, run the same way.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -458,4 +460,138 @@ fn a_shard_dinits_itself_from_inside_its_pane() {
     );
     let out = std::fs::read_to_string(w.ctl().join("out.s1")).unwrap_or_default();
     assert!(out.is_empty() || out.contains("dinit s1 -> main"), "{out}");
+}
+
+/// `mem` from a pane with a note body in a file in the pane's directory.
+fn put_from_pane(
+    w: &World,
+    env: &BTreeMap<String, String>,
+    path: &str,
+    text: &str,
+    extra: &[&str],
+) -> String {
+    let f = Path::new(&env["PWD"]).join("body.md");
+    std::fs::write(&f, text).unwrap();
+    let mut args = vec!["put", path, f.to_str().unwrap(), "--why", "log"];
+    args.extend_from_slice(extra);
+    let out = ok(&w.pane(env, &args));
+    std::fs::remove_file(&f).unwrap();
+    out
+}
+
+#[test]
+fn notes_with_owners_from_the_pane_ride_the_branch_and_find_ranks_them() {
+    let Some(w) = world() else { return };
+    let a = w.start("s1", "Ada");
+    let b = w.start("s2", "Basil");
+    let main0 = w.main_head();
+
+    let out = put_from_pane(
+        &w,
+        &a,
+        "notes/kiln.md",
+        "Kiln east runs hot.\n",
+        &["--for", "ada"],
+    );
+    assert!(out.starts_with("wrote notes/ada/kiln.md"), "{out}");
+    let out = put_from_pane(&w, &a, "notes/runbook.md", "Check the kiln vent.\n", &[]);
+    assert!(out.starts_with("wrote notes/runbook.md"), "{out}");
+    let out = put_from_pane(
+        &w,
+        &b,
+        "kiln.md",
+        "Basil: kiln shelf cracked.\n",
+        &["--for", "basil"],
+    );
+    assert!(out.starts_with("wrote notes/basil/kiln.md"), "{out}");
+    // A person's note can't be put outside notes/.
+    let e = fails(&w.pane(
+        &a,
+        &["put", "people/ada.md", "-", "--why", "x", "--for", "ada"],
+    ));
+    assert!(e.contains("notes/<person>/"), "{e}");
+
+    // On each shard's own branch only.
+    assert_eq!(w.main_head(), main0, "main moved");
+    let mine = ok(&w.pane(&a, &["notes", "find", "kiln", "--for", "ada"]));
+    assert!(
+        mine.contains("notes/ada/kiln.md  (ada's own note, "),
+        "{mine}"
+    );
+    assert!(!mine.contains("basil"), "{mine}");
+    assert!(ok(&w.mem(&["notes", "find", "kiln", "--for", "ada"])).contains("no notes mention"));
+
+    // Both dinit with no core review: merged, nothing held.
+    for id in ["s1", "s2"] {
+        let out = ok(&w.mem(&["dinit", "--id", id]));
+        assert!(out.contains("merged    notes/"), "{out}");
+        assert!(
+            !out.contains("PROPOSAL") && !out.contains("CONFLICT"),
+            "{out}"
+        );
+        assert!(out.contains(&format!("shard {id} closed")), "{out}");
+    }
+
+    // From a fresh pane: Basil's own first, then shared, then everyone else's,
+    // each named with whose it is and its date. The kiln fact is not a note.
+    let c = w.start("s3", "Basil");
+    let out = ok(&w.pane(&c, &["notes", "find", "kiln", "--for", "basil"]));
+    let day = |p: &str| git(&w.m, &["log", "-1", "--format=%as", "main", "--", p]);
+    let want = [
+        format!(
+            "notes/basil/kiln.md  (basil's own note, {})",
+            day("notes/basil/kiln.md")
+        ),
+        "    Basil: kiln shelf cracked.".to_string(),
+        format!(
+            "notes/runbook.md  (shared note, {})",
+            day("notes/runbook.md")
+        ),
+        "    Check the kiln vent.".to_string(),
+        format!(
+            "notes/ada/kiln.md  (ada's note, {})",
+            day("notes/ada/kiln.md")
+        ),
+        "    Kiln east runs hot.".to_string(),
+    ];
+    assert_eq!(out.lines().collect::<Vec<_>>(), want, "{out}");
+    assert!(!out.contains("facts/"), "{out}");
+    let json = ok(&w.pane(&c, &["notes", "find", "kiln", "--for", "basil", "--json"]));
+    assert!(json.contains("\"rank\": \"own\""), "{json}");
+}
+
+#[test]
+fn intervals_are_read_from_the_main_root_by_a_pane() {
+    let Some(w) = world() else { return };
+    let a = w.start("s1", "Ada");
+    let archive = |w: &World| ok(&w.pane(&a, &["quirk", "archive"]));
+    assert!(
+        archive(&w).contains("quiet for 90 day(s)"),
+        "{}",
+        archive(&w)
+    );
+
+    let base = std::fs::read_to_string(w.m.join("shards.toml")).unwrap();
+    // Old place alone: still read.
+    std::fs::write(
+        w.m.join("shards.toml"),
+        format!("{base}[quirks]\narchive_after_days = 7\n"),
+    )
+    .unwrap();
+    assert!(
+        archive(&w).contains("quiet for 7 day(s)"),
+        "{}",
+        archive(&w)
+    );
+    // Both: [intervals] wins.
+    std::fs::write(
+        w.m.join("shards.toml"),
+        format!("{base}[intervals]\nquirk_archive_days = 14\n[quirks]\narchive_after_days = 7\n"),
+    )
+    .unwrap();
+    assert!(
+        archive(&w).contains("quiet for 14 day(s)"),
+        "{}",
+        archive(&w)
+    );
 }
