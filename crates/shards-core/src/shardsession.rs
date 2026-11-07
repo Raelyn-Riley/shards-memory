@@ -226,6 +226,11 @@ pub fn one_line(text: &str) -> String {
 ///   value inherited from whoever started the server can't stand in for
 ///   them: a write in the worktree is stamped with the shard and the
 ///   shard's own human from its record.
+/// - `PATH` also holds the directory of the running `mem` (so the agent can
+///   run `mem`) and `~/.local/bin` and `~/bin` when they exist, where
+///   per-user installs such as Claude Code's live. A tmux server started
+///   from a service or a bare shell often lacks them, and the pane's
+///   `/bin/sh` reads no profile.
 pub fn shard_pane_env(meta: &ShardMeta) -> Vec<(String, String)> {
     vec![
         (
@@ -235,9 +240,39 @@ pub fn shard_pane_env(meta: &ShardMeta) -> Vec<(String, String)> {
         ("SHARDS_SHARD".to_string(), meta.id.clone()),
         ("SHARDS_AUTHOR".to_string(), meta.id.clone()),
         ("SHARDS_HUMAN".to_string(), String::new()),
+        ("PATH".to_string(), pane_path()),
         ("PS1".to_string(), PS1.to_string()),
         ("ENV".to_string(), String::new()),
     ]
+}
+
+/// This process's `PATH`, with `mem`'s own directory in front and the usual
+/// per-user bin directories (that exist) at the end.
+fn pane_path() -> String {
+    let base = std::env::var_os("PATH")
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into());
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(&base).collect();
+    let mem_dir = std::env::current_exe()
+        .ok()
+        .filter(|e| e.file_stem().is_some_and(|n| n == "mem"))
+        .and_then(|e| e.parent().map(PathBuf::from));
+    if let Some(d) = mem_dir {
+        if !dirs.contains(&d) {
+            dirs.insert(0, d);
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+        let home = PathBuf::from(home);
+        for d in [home.join(".local").join("bin"), home.join("bin")] {
+            if d.is_dir() && !dirs.contains(&d) {
+                dirs.push(d);
+            }
+        }
+    }
+    std::env::join_paths(dirs)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| base.to_string_lossy().into_owned())
 }
 
 impl Memory {
@@ -544,6 +579,19 @@ impl Memory {
 
     /// End a closing shard's session (a clean dinit, which holds the shard
     /// lock and deletes the record, so nothing is written here).
+    /// Is this process running inside the shard's own pane (the shard's
+    /// agent ran `mem` itself)? Ending that session would end this process
+    /// too, so a dinit closes the shard first and ends the session last.
+    pub(crate) fn inside_shard_pane(&self, meta: &ShardMeta) -> bool {
+        let Ok(sp) = self.shard_pane(meta) else {
+            return false;
+        };
+        sp.pane
+            .tmux
+            .pane()
+            .is_some_and(|p| tmux::is_ancestor(p.pid, std::process::id()))
+    }
+
     pub(crate) fn shard_session_end(&self, meta: &ShardMeta) -> bool {
         let Ok(sp) = self.shard_pane(meta) else {
             return false;
