@@ -177,6 +177,38 @@ impl PaneRunner {
     }
 }
 
+/// This process's `PATH`, with `mem`'s own directory in front and the usual
+/// per-user bin directories (that exist) at the end: the `PATH` the core's
+/// and every shard's pane give their shell, so a bare `claude` (installed in
+/// `~/.local/bin`) and `mem` start even when the tmux server's `PATH` is
+/// bare and the pane's `/bin/sh` reads no profile.
+pub(crate) fn pane_path() -> String {
+    let base = std::env::var_os("PATH")
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into());
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(&base).collect();
+    let mem_dir = std::env::current_exe()
+        .ok()
+        .filter(|e| e.file_stem().is_some_and(|n| n == "mem"))
+        .and_then(|e| e.parent().map(PathBuf::from));
+    if let Some(d) = mem_dir {
+        if !dirs.contains(&d) {
+            dirs.insert(0, d);
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+        let home = PathBuf::from(home);
+        for d in [home.join(".local").join("bin"), home.join("bin")] {
+            if d.is_dir() && !dirs.contains(&d) {
+                dirs.push(d);
+            }
+        }
+    }
+    std::env::join_paths(dirs)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| base.to_string_lossy().into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::squash;
