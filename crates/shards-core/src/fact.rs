@@ -16,12 +16,14 @@
 //!
 //! Every front-matter value is written as a double-quoted string using JSON
 //! escaping, which is also valid YAML. Keys are written in the fixed order
-//! above; `human` is omitted when there is none. The body is the value
-//! followed by exactly one newline.
+//! above; `human` is omitted when there is none. A fact accepted from a
+//! shard's proposal adds `proposal` (`p3#2`), `reviewed_by` and
+//! `review_why` after `why`: `author`, `human` and `why` stay the shard's.
+//! The body is the value followed by exactly one newline.
 
 use crate::error::{Error, Result};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FrontMatter {
     pub address: String,
     /// RFC 3339, UTC, written by the tool.
@@ -29,6 +31,12 @@ pub struct FrontMatter {
     pub author: String,
     pub human: Option<String>,
     pub why: String,
+    /// The proposal change this value was accepted from, e.g. `p3#2`.
+    pub proposal: Option<String>,
+    /// Who accepted it (the core, or a human).
+    pub reviewed_by: Option<String>,
+    /// The reviewer's reason.
+    pub review_why: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +61,15 @@ impl Fact {
             pairs.push(("human", h.as_str()));
         }
         pairs.push(("why", f.why.as_str()));
+        for (k, v) in [
+            ("proposal", &f.proposal),
+            ("reviewed_by", &f.reviewed_by),
+            ("review_why", &f.review_why),
+        ] {
+            if let Some(v) = v {
+                pairs.push((k, v.as_str()));
+            }
+        }
         render_front(&pairs, &format!("{}\n", self.value))
     }
 
@@ -77,6 +94,9 @@ impl Fact {
                 author: get("author").ok_or_else(|| bad("missing `author`"))?,
                 human: get("human").filter(|v| !v.is_empty()),
                 why: get("why").ok_or_else(|| bad("missing `why`"))?,
+                proposal: get("proposal").filter(|v| !v.is_empty()),
+                reviewed_by: get("reviewed_by").filter(|v| !v.is_empty()),
+                review_why: get("review_why").filter(|v| !v.is_empty()),
             },
             value,
         })
@@ -145,6 +165,7 @@ mod tests {
                 author: "shard-7f3a".into(),
                 human: human.map(String::from),
                 why: "moved: to the \"new\" switch".into(),
+                ..Default::default()
             },
             value: value.into(),
         }
@@ -156,6 +177,15 @@ mod tests {
             sample(Some("Raelyn"), "10.0.4.40"),
             sample(None, "line one\n---\nline three"),
             sample(None, "trailing newline\n"),
+            Fact {
+                front: FrontMatter {
+                    proposal: Some("p3#2".into()),
+                    reviewed_by: Some("core".into()),
+                    review_why: Some("matches the label".into()),
+                    ..sample(Some("Ada"), "x").front
+                },
+                value: "10.0.4.41".into(),
+            },
         ] {
             let text = f.render();
             assert_eq!(Fact::parse(&text, "t").unwrap(), f, "{text}");

@@ -61,7 +61,7 @@ enum Cmd {
         /// The value; `-` reads it from stdin.
         value: String,
         #[arg(long)]
-        why: String,
+        why: Option<String>,
         #[command(flatten)]
         who: Who,
     },
@@ -71,7 +71,7 @@ enum Cmd {
         /// The value; `-` reads it from stdin.
         value: String,
         #[arg(long)]
-        why: String,
+        why: Option<String>,
         #[command(flatten)]
         who: Who,
     },
@@ -98,7 +98,7 @@ enum Cmd {
         /// File to read the contents from; `-` or omitted reads stdin.
         file: Option<PathBuf>,
         #[arg(long)]
-        why: String,
+        why: Option<String>,
         /// Whose note it is: writes notes/<person>/<file>. Without it, a
         /// notes/<file>.md path is a shared note.
         #[arg(long = "for", value_name = "PERSON")]
@@ -125,7 +125,7 @@ enum Cmd {
         #[arg(long)]
         take: String,
         #[arg(long)]
-        why: String,
+        why: Option<String>,
         /// Which shard's conflict, if several shards conflict on it.
         #[arg(long)]
         shard: Option<String>,
@@ -747,8 +747,14 @@ fn qprov(author: Option<String>) -> Provenance {
     Provenance::new(author, None, "")
 }
 
-fn prov(who: Who, why: String) -> Provenance {
-    Provenance::new(who.author.unwrap_or_default(), given(who.human), why)
+/// A missing `--why` reaches the library as empty, which refuses it with a
+/// message telling the agent to say why (clap's own error doesn't).
+fn prov(who: Who, why: Option<String>) -> Provenance {
+    Provenance::new(
+        who.author.unwrap_or_default(),
+        given(who.human),
+        why.unwrap_or_default(),
+    )
 }
 
 /// An empty value (a shard's pane clears `SHARDS_HUMAN`) is no value.
@@ -771,7 +777,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let mut out = io::stdout().lock();
     match cli.cmd {
         Cmd::Init { dir, who } => {
-            Memory::init(&dir, &prov(who, String::new()))?;
+            Memory::init(&dir, &prov(who, None))?;
             writeln!(out, "initialized memory at {}", dir.display())?;
         }
         Cmd::Get { address } => {
@@ -812,6 +818,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 writeln!(out, "  author: {}", e.author)?;
                 writeln!(out, "  human:  {}", e.human.as_deref().unwrap_or("-"))?;
                 writeln!(out, "  why:    {}", e.why)?;
+                if let Some(r) = &e.review {
+                    writeln!(out, "  review: {} accepted it from {}: {}", r.by, r.proposal, r.why)?;
+                }
                 writeln!(out, "  value:  {}", e.value.replace('\n', "\n          "))?;
             }
         }

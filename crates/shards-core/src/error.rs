@@ -24,7 +24,7 @@ pub enum Error {
     #[error("the value must not be empty")]
     EmptyValue,
 
-    #[error("--why is required and must not be empty")]
+    #[error("a reason is required: add --why \"...\" saying why you are making this change (e.g. --why \"read it off the label\"); the core reviews every fact and people change by its reason")]
     MissingWhy,
 
     #[error("no author: pass --author or set SHARDS_AUTHOR")]

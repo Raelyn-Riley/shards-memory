@@ -144,6 +144,17 @@ pub struct HistoryEntry {
     pub author: String,
     pub human: Option<String>,
     pub why: String,
+    /// Set when the version was accepted from a shard's proposal.
+    pub review: Option<Review>,
+}
+
+/// How a version accepted from a proposal was reviewed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Review {
+    /// `p3#2`: the proposal and the change number.
+    pub proposal: String,
+    pub by: String,
+    pub why: String,
 }
 
 /// Which branch this worktree is on.
@@ -651,6 +662,11 @@ impl Memory {
                     author: f.front.author,
                     human: f.front.human,
                     why: f.front.why,
+                    review: f.front.proposal.map(|proposal| Review {
+                        proposal,
+                        by: f.front.reviewed_by.unwrap_or_default(),
+                        why: f.front.review_why.unwrap_or_default(),
+                    }),
                 });
             }
         }
@@ -833,6 +849,7 @@ pub(crate) fn fact_file(address: &Address, value: &str, prov: &Provenance) -> St
             author: prov.author.clone(),
             human: prov.human.clone().filter(|h| !h.is_empty()),
             why: prov.why.clone(),
+            ..Default::default()
         },
         value: value.to_string(),
     }
