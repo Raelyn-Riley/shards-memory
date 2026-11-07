@@ -556,19 +556,27 @@ was woken for is kept in `watch.json`, and a pass wakes the core only if a pendi
 event is newer than that. So the same pending set never wakes the core twice, and a
 new event wakes it again, once, naming all that are pending.
 
-**When a wake arrives mid-turn.** Claude Code queues a line typed while it is busy and
-takes it when the current turn ends, so the wake is read late, not lost. Nothing is
-taken off the pending list until the core acks. Further passes see that the core was
-already woken for those events and don't type again. A new event fires one new wake
-line, which queues the same way. If the core dies before it acks, the events are still
-pending. The watchdog then forgets which set the core was woken for, so the restored
-session is woken again, once.
+**When a wake arrives mid-turn.** Claude Code queues a line typed while it is busy (an
+`enqueue` record in the transcript, which counts as landed). At its next tool call it
+feeds the line into the *same* turn, as "a new message while you were working", rather
+than as a new prompt. A line still queued when the turn ends becomes the next prompt. So
+the wake is read late, not lost; on Claude Code 2.1.319 (haiku) the core finished its
+task, then read the context and acked. Nothing is taken off the pending list until the
+core acks. Further passes see that the core was already woken for those events and
+don't type again. A new event fires one new wake line, which queues the same way. If the
+core dies before it acks, the events are still pending. The watchdog then forgets which
+set the core was woken for, so the restored session is woken again, once.
 
 **The watchdog.** `mem core check` is one pass. Each `mem watch` pass also runs one when
 `[core] watchdog = true` (the default) and a core has been started. If the pane or its
 command is gone, the watchdog restores the pane and **resumes the pinned session by its
 explicit id** (`claude --resume <id>`). It never uses `--continue`, which picks the most
-recently touched transcript, and that can be the wrong session. A restore counts as
+recently touched transcript, and that can be the wrong session. Resuming keeps the same
+id and transcript, so it is the same conversation. Before it types the resume line, it
+gives the pane a new shell (`tmux respawn-pane`): Claude Code killed with SIGKILL
+leaves the terminal raw and on its alternate screen, and a shell in that state shows
+nothing typed and takes Enter as a plain character. Every launch (start, restore,
+handoff, shard start) does the same, and the pane and anyone attached stay. A restore counts as
 working if the command is still running a moment after it starts. Every step goes to
 `.shards/core/core.log`. After three failed restores in a row, it stops trying, records
 a `core-down` event and says so in `mem core status`. `mem core start` resets it. A
@@ -613,6 +621,9 @@ a heartbeat, such as a wake or a person typing.
   read and cache creation, summed over the reply's model calls, and the same counts for
   its first call.
 
+A wake that was queued into a busy turn (see above) is matched to that turn. If two
+wakes joined the same turn, the second is logged with `same_turn: true` and no usage of
+its own, and the summary leaves it out, so the turn isn't counted twice.
 A reply counts as **warm** when its first call read more from the cache than it wrote.
 `mem core usage` prints, for wakes and pings, the average cost by gap length, split
 into warm and cold. It records numbers only, under the same privacy rule as the board.
