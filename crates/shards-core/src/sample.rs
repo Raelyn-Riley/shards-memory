@@ -337,6 +337,18 @@ pub fn fake_transcript(
 ///
 /// `sh fake-core.sh <projects> <ctl> [--resume <id> | --session-id <id>] [-- <first message>]`
 ///
+/// Like Claude Code (checked on 2.1.319), it puts its terminal in raw mode
+/// (no echo, no line editing, Enter is a bare carriage return) and the
+/// alternate screen, echoes what is typed itself, and restores the terminal
+/// only when it exits cleanly (`/exit`, or SIGTERM). Killed with SIGKILL, it
+/// leaves the pane's shell unable to take a typed line.
+///
+/// A prompt `work <n>` starts a busy turn of `n` seconds with one tool call
+/// a second. A line typed during it is queued the way Claude Code queues
+/// it: a `queue-operation` enqueue record at once, then, at the next tool
+/// call, a `queued_command` attachment *inside the same turn* (not a new
+/// prompt). A line still queued when the turn ends becomes the next prompt.
+///
 /// Each start appends `args: ...` to `<ctl>/starts.log`. Files in `<ctl>`
 /// change its behaviour: `fail-all` (exit at once), `fail-fresh` (exit at
 /// once unless resuming), `ignore-exit` (`/exit` does nothing),
@@ -362,31 +374,90 @@ if [ -e "$ctl/trust-prompt" ]; then
   read -r answer; exit 0
 fi
 mkdir -p "$projects/$slug"
-n=0
+# Raw terminal and the alternate screen, undone only on a clean exit.
+# Reads block (min 1) as Claude Code's do, except in a busy turn, which needs
+# a clock: then a read gives up after 0.1 s (min 0 time 1).
+stty -echo -icanon -icrnl min 1 time 0 2>/dev/null
+printf '\033[?1049h'
+trap 'printf "\033[?1049l"; stty sane 2>/dev/null' EXIT
+trap 'exit 143' TERM
+n=0; busy_until=0; next_tool=0; tools=0; queue=""
+CR=$(printf '\r'); NL='
+'
 ts() { date -u +%Y-%m-%dT%H:%M:%S.%3NZ; }
 esc() { printf %s "$1" | tr '\n\t' '  ' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+usage() {
+  read=5000; write=200
+  [ -e "$ctl/cold" ] && { read=0; write=5200; }
+  printf '"usage":{"input_tokens":3,"output_tokens":%s,"cache_read_input_tokens":%s,"cache_creation_input_tokens":%s}' "$1" "$read" "$write"
+}
+reply() {
+  out=40
+  case "$1" in \[[0-9][0-9]:[0-9][0-9]\]) out=1;; esac
+  printf '{"type":"assistant","timestamp":"%s","sessionId":"%s","message":{"id":"msg-%s-%s","role":"assistant","stop_reason":"end_turn",%s,"content":[{"type":"text","text":"PLANTED-CORE-REPLY"}]}}\n' "$(ts)" "$id" "$$" "$n" "$(usage $out)" >> "$tx"
+  printf 'fake-core: replied (%s)\r\n' "$n"
+}
 turn() {
   n=$((n+1))
   printf '{"type":"user","timestamp":"%s","sessionId":"%s","message":{"role":"user","content":"%s"}}\n' "$(ts)" "$id" "$(esc "$1")" >> "$tx"
-  out=40
-  case "$1" in \[[0-9][0-9]:[0-9][0-9]\]) out=1;; esac
-  read=5000; write=200
-  [ -e "$ctl/cold" ] && { read=0; write=5200; }
-  printf '{"type":"assistant","timestamp":"%s","sessionId":"%s","message":{"id":"msg-%s-%s","role":"assistant","stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":%s,"cache_read_input_tokens":%s,"cache_creation_input_tokens":%s},"content":[{"type":"text","text":"PLANTED-CORE-REPLY"}]}}\n' "$(ts)" "$id" "$$" "$n" "$out" "$read" "$write" >> "$tx"
-  echo "fake-core: replied ($n)"
+  case "$1" in
+    "work "*)
+      now=$(date +%s); busy_until=$((now + ${1#work })); next_tool=$((now + 1))
+      stty min 0 time 1 2>/dev/null
+      printf 'fake-core: working (%s)\r\n' "$n";;
+    *) reply "$1";;
+  esac
 }
-[ $# -gt 0 ] && turn "$1"
-echo "fake-core: session $id ready"
-printf '\342\235\257 \n'
-while IFS= read -r line; do
-  case "$line" in
+# A tool call in a busy turn; queued lines join the turn here.
+tool() {
+  tools=$((tools+1))
+  printf '{"type":"assistant","timestamp":"%s","sessionId":"%s","message":{"id":"msg-%s-%s-t%s","role":"assistant","stop_reason":"tool_use",%s,"content":[{"type":"tool_use","name":"Bash","input":{"command":"sleep 1"}}]}}\n' "$(ts)" "$id" "$$" "$n" "$tools" "$(usage 20)" >> "$tx"
+  printf '{"type":"user","timestamp":"%s","sessionId":"%s","message":{"role":"user","content":[{"type":"tool_result","content":"PLANTED-TOOL-RESULT"}]}}\n' "$(ts)" "$id" >> "$tx"
+  printf %s "$queue" | while IFS= read -r q; do
+    printf '{"type":"queue-operation","operation":"remove","timestamp":"%s","sessionId":"%s","content":"%s"}\n' "$(ts)" "$id" "$(esc "$q")" >> "$tx"
+    printf '{"type":"attachment","timestamp":"%s","sessionId":"%s","attachment":{"type":"queued_command","prompt":"%s"}}\n' "$(ts)" "$id" "$(esc "$q")" >> "$tx"
+  done
+  queue=""
+}
+tick() {
+  [ "$busy_until" -eq 0 ] && return
+  now=$(date +%s)
+  [ "$now" -ge "$next_tool" ] && { tool; next_tool=$((now + 1)); }
+  if [ "$now" -ge "$busy_until" ]; then
+    busy_until=0; stty min 1 time 0 2>/dev/null; reply work
+    left=$queue; queue=""
+    while IFS= read -r q; do [ -n "$q" ] && turn "$q"; done <<EOF
+$left
+EOF
+  fi
+}
+line() {
+  case "$1" in
     /exit)
-      [ -e "$ctl/ignore-exit" ] && continue
+      [ -e "$ctl/ignore-exit" ] && return
       [ -e "$ctl/slow-exit" ] && sleep 2
       exit 0;;
     "") ;;
-    *) turn "$line";;
+    *)
+      if [ "$busy_until" -gt 0 ]; then
+        printf '{"type":"queue-operation","operation":"enqueue","timestamp":"%s","sessionId":"%s","content":"%s"}\n' "$(ts)" "$id" "$(esc "$1")" >> "$tx"
+        queue="$queue$1$NL"
+        printf 'fake-core: queued\r\n'
+      else
+        turn "$1"
+      fi;;
   esac
+}
+[ $# -gt 0 ] && turn "$1"
+printf 'fake-core: session %s ready\r\n\342\235\257 ' "$id"
+buf=""
+while :; do
+  c=$(dd bs=1 count=1 2>/dev/null; echo .); c=${c%.}
+  if [ -z "$c" ]; then tick; continue; fi
+  if [ "$c" = "$CR" ] || [ "$c" = "$NL" ]; then
+    printf '\r\n'; l=$buf; buf=""; line "$l"; continue
+  fi
+  buf="$buf$c"; printf %s "$c"
 done
 "#;
 
