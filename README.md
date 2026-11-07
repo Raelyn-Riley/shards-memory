@@ -124,8 +124,23 @@ a merge conflict.
 
 A shard is a whole agent session, the same shape as the core, not a sub-agent.
 `mem shard start --human Ada` opens the shard, then starts `[shards] command` (default
-`claude`) in a pane whose shell sits in the shard's worktree, with `SHARDS_MEMORY` and
-`SHARDS_SHARD` set. It prints the id, the session and the attach command.
+`claude`) in a pane whose shell sits in the shard's worktree. It prints the id, the
+session and the attach command.
+
+- **Its writes stay on its branch.** The pane sets `SHARDS_MEMORY` to the shard's
+  *worktree*, so `mem set`, `supersede` and `put` run by the shard's agent commit to
+  `shard/<id>` (under the shard lock), and `get`, `history` and `resolve` read the
+  shard's own branch. Main doesn't move and other shards don't see the work until
+  `mem dinit`. `dinit`, `board`, `shard ...`, `core ...` and `quirk ...` find main from
+  the worktree, and quirks still go straight to main.
+- **Stamped without guessing.** The pane sets `SHARDS_SHARD` and `SHARDS_AUTHOR` to the
+  shard id and clears `SHARDS_HUMAN`, so nothing inherited from whoever started the
+  shards server stands in. Every commit is authored by the shard id, with the shard's
+  human from its record.
+- **Finds `claude` and `mem`.** The shards server inherits `PATH` from whoever started
+  it, and the pane's `/bin/sh` reads no profile. So the pane's `PATH` adds
+  `~/.local/bin` and `~/bin` when they exist (where per-user installs such as Claude
+  Code's live) and the directory of the `mem` that started it.
 
 - **One shards server.** Every shard's pane is on one tmux server
   (`[shards] socket`, default `.shards/sessions/tmux.sock`), separate from the core's
@@ -209,6 +224,13 @@ proposal and no open records under `conflicts/<id>/`. A clean dinit removes the 
 worktree (one with uncommitted changes is kept and reported). It keeps or deletes the
 branch per `[shards] keep_branches`, then drops the shard from `mem shard list`.
 Otherwise the shard stays open until its conflicts and proposals are settled.
+
+**A shard that dinits itself.** A clean dinit normally stops the shard's session before
+it removes the worktree. When the shard's own agent runs `mem dinit` in its pane, that
+session is busy waiting on the command and can't take `/exit`. So dinit closes the
+shard first, then lets go of the shard lock, logs it, and closes the shard's tmux
+session, which ends the agent and `mem` with it. The agent never sees the report; it is
+in `.shards/sessions/sessions.log` and in main's history.
 
 ### Conflicts
 
@@ -665,9 +687,9 @@ through a shard branch, a dinit or the core.
 - **Dinit leaves them alone.** Shards never change `quirks/` on their own branch, and
   dinit builds its merge from main's tree, so quirks survive every merge.
 
-**Who wrote it.** The git author follows the usual rules: in a shard worktree it is the
-shard id. In a shard's pane, `SHARDS_MEMORY` is the main root, so when no `--author` is
-given, quirk commands use `SHARDS_SHARD`.
+**Who wrote it.** The git author follows the usual rules: in a shard worktree (which is
+what a shard's pane points `SHARDS_MEMORY` at) it is the shard id. Pointed at the main
+root with no `--author`, quirk commands use `SHARDS_SHARD` when it is set.
 
 **States.** `state` is what the code acts on, and `status` is the wording people see:
 
