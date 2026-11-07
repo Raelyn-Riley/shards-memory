@@ -13,8 +13,9 @@ use shards_core::coresession::summarize_usage;
 use shards_core::coresession::Landed;
 use shards_core::shardsession::ShardLaunch;
 use shards_core::{
-    resolve, sample, Address, CoreStatus, DinitReport, Memory, PassReport, Provenance,
-    ResolveOptions, ShardMeta, ShardStart, Side, StartReport, Take, UsageEntry, WakeOutcome,
+    resolve, sample, Address, CoreStatus, DinitReport, Memory, NewQuirk, PassReport, Provenance,
+    Quirk, QuirkState, ResolveOptions, ShardMeta, ShardStart, Side, StartReport, Take, UsageEntry,
+    WakeOutcome,
 };
 
 #[derive(Parser)]
@@ -145,6 +146,10 @@ enum Cmd {
     /// The reasoning core's view.
     #[command(subcommand)]
     Core(CoreCmd),
+    /// Known quirks: what's weird about a tool right now. Written straight
+    /// to main from any shard, visible to every shard at once.
+    #[command(subcommand)]
+    Quirk(QuirkCmd),
     /// Test helpers.
     #[command(subcommand, hide = true)]
     Debug(DebugCmd),
@@ -260,6 +265,73 @@ enum CoreCmd {
     Usage {
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum QuirkCmd {
+    /// Post a quirk (the report time is set automatically). Duplicates are fine.
+    Add {
+        #[arg(long)]
+        tool: String,
+        #[arg(long)]
+        quirk: String,
+        /// Who reported it.
+        #[arg(long)]
+        by: String,
+        /// Free-text details; `-` reads stdin.
+        #[arg(long)]
+        details: Option<String>,
+        #[arg(long, env = "SHARDS_AUTHOR")]
+        author: Option<String>,
+    },
+    /// Open quirks (all of them with --all, including fixed and archived).
+    List {
+        #[arg(long)]
+        tool: Option<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Every version of a quirk's status, newest first.
+    History { id: String },
+    /// Set a quirk's status in words; it is open again. The old status stays in history.
+    Update {
+        id: String,
+        #[arg(long)]
+        status: String,
+        #[arg(long)]
+        by: String,
+        #[arg(long, env = "SHARDS_AUTHOR")]
+        author: Option<String>,
+    },
+    /// Mark a quirk fixed: status becomes "fixed by PERSON".
+    Fix {
+        id: String,
+        #[arg(long)]
+        by: String,
+        #[arg(long, env = "SHARDS_AUTHOR")]
+        author: Option<String>,
+    },
+    /// A quirk came up again: resets its archive clock (unarchives it).
+    Mention {
+        id: String,
+        #[arg(long, env = "SHARDS_HUMAN")]
+        by: Option<String>,
+        #[arg(long, env = "SHARDS_AUTHOR")]
+        author: Option<String>,
+    },
+    /// Archive fixed quirks not mentioned for N days. Open quirks never archive;
+    /// nothing is deleted.
+    Archive {
+        /// Default: [quirks] archive_after_days in shards.toml (30).
+        #[arg(long)]
+        days: Option<f64>,
+        #[arg(long, env = "SHARDS_HUMAN")]
+        by: Option<String>,
+        #[arg(long, env = "SHARDS_AUTHOR")]
+        author: Option<String>,
     },
 }
 
@@ -617,6 +689,36 @@ fn read_value(v: String) -> io::Result<String> {
     } else {
         Ok(v)
     }
+}
+
+fn print_quirk(out: &mut impl Write, q: &Quirk) -> io::Result<()> {
+    writeln!(
+        out,
+        "{}  [{}]  {}  ({})",
+        q.id,
+        q.tool,
+        q.quirk,
+        q.state.as_str()
+    )?;
+    writeln!(
+        out,
+        "    reported by {} at {}; status: {} ({}, {})",
+        q.reported_by, q.reported, q.status, q.status_by, q.status_at
+    )?;
+    if let Some(m) = &q.last_mentioned {
+        writeln!(out, "    last mentioned {m}")?;
+    }
+    if let Some(a) = &q.archived_at {
+        writeln!(out, "    archived {a}")?;
+    }
+    if let Some(d) = &q.details {
+        writeln!(out, "    details: {}", d.replace('\n', "\n             "))?;
+    }
+    Ok(())
+}
+
+fn qprov(author: Option<String>) -> Provenance {
+    Provenance::new(author.unwrap_or_default(), None, "")
 }
 
 fn prov(who: Who, why: String) -> Provenance {
@@ -1018,6 +1120,105 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         },
+        Cmd::Quirk(q) => {
+            let mem = Memory::open(&cli.memory)?;
+            match q {
+                QuirkCmd::Add {
+                    tool,
+                    quirk,
+                    by,
+                    details,
+                    author,
+                } => {
+                    let details = details.map(read_value).transpose()?;
+                    let q = mem.quirk_add(
+                        &NewQuirk {
+                            tool,
+                            quirk,
+                            by,
+                            details,
+                        },
+                        &qprov(author),
+                    )?;
+                    writeln!(out, "posted {} for {}: {}", q.id, q.tool, q.quirk)?;
+                }
+                QuirkCmd::List { tool, all, json } => {
+                    let list: Vec<Quirk> = mem
+                        .quirks()?
+                        .into_iter()
+                        .filter(|q| all || q.state == QuirkState::Open)
+                        .filter(|q| tool.as_ref().is_none_or(|t| &q.tool == t))
+                        .collect();
+                    if json {
+                        writeln!(out, "{}", serde_json::to_string_pretty(&list)?)?;
+                    } else if list.is_empty() {
+                        writeln!(
+                            out,
+                            "no {}quirks{}",
+                            if all { "" } else { "open " },
+                            tool.map(|t| format!(" for {t}")).unwrap_or_default()
+                        )?;
+                    } else {
+                        for q in &list {
+                            print_quirk(&mut out, q)?;
+                        }
+                    }
+                }
+                QuirkCmd::History { id } => {
+                    for v in mem.quirk_history(&id)? {
+                        writeln!(
+                            out,
+                            "{}  {}  {}  by {} (via {})  state {}: {}",
+                            v.at(),
+                            short(&v.commit),
+                            v.op,
+                            v.quirk.status_by,
+                            v.author,
+                            v.quirk.state.as_str(),
+                            v.quirk.status
+                        )?;
+                    }
+                }
+                QuirkCmd::Update {
+                    id,
+                    status,
+                    by,
+                    author,
+                } => {
+                    let q = mem.quirk_update(&id, &status, &by, &qprov(author))?;
+                    writeln!(out, "{} status: {} ({})", q.id, q.status, q.state.as_str())?;
+                }
+                QuirkCmd::Fix { id, by, author } => {
+                    let q = mem.quirk_fix(&id, &by, &qprov(author))?;
+                    writeln!(out, "{} status: {}", q.id, q.status)?;
+                }
+                QuirkCmd::Mention { id, by, author } => {
+                    let q = mem.quirk_mention(&id, by.as_deref().unwrap_or(""), &qprov(author))?;
+                    writeln!(
+                        out,
+                        "{} mentioned at {} ({})",
+                        q.id,
+                        q.last_mentioned.as_deref().unwrap_or("?"),
+                        q.state.as_str()
+                    )?;
+                }
+                QuirkCmd::Archive { days, by, author } => {
+                    let days = days.unwrap_or(mem.config().quirks.archive_after_days);
+                    let mut p = qprov(author);
+                    p.human = by;
+                    let done = mem.quirk_archive(days, &p)?;
+                    if done.is_empty() {
+                        writeln!(
+                            out,
+                            "nothing to archive (fixed and quiet for {days} day(s))"
+                        )?;
+                    }
+                    for q in &done {
+                        writeln!(out, "archived {}  [{}]  {}", q.id, q.tool, q.quirk)?;
+                    }
+                }
+            }
+        }
         Cmd::Debug(DebugCmd::HoldLock { secs, holder }) => {
             let mem = Memory::open(&cli.memory)?;
             let guards = mem.lock_main(&[], &holder, None)?;
