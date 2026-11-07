@@ -1,0 +1,452 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Raelyn Rose
+
+//! Brief 08: a shard's writes stay on its own branch until dinit, when they
+//! are run the way a shard's agent runs them, from its pane.
+//!
+//! Each shard is started for real (`mem shard start`) on the default
+//! `[shards] command`, `claude`. That `claude` is a stand-in found only in
+//! `$HOME/.local/bin` (the launcher's PATH lacks it, as on a real machine): it
+//! records the exact environment the pane gave it, then runs the fake core
+//! from `shards_core::sample`, so no model is called. `mem` is then run with
+//! that environment and nothing else, in the pane's directory. One test runs
+//! `mem dinit` inside the pane itself. Without tmux the tests pass with a note.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
+
+use shards_core::sample::write_fake_core;
+use shards_core::tmux::{self, Tmux};
+use tempfile::TempDir;
+
+/// The launcher's PATH: system dirs only, no `~/.local/bin`, no `mem`.
+const BARE_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+
+struct World {
+    tmp: TempDir,
+    m: PathBuf,
+}
+
+impl Drop for World {
+    fn drop(&mut self) {
+        Tmux::new(self.tmp.path().join("shards.sock"), "x").kill_server();
+    }
+}
+
+impl World {
+    fn home(&self) -> PathBuf {
+        self.tmp.path().join("home")
+    }
+    fn ctl(&self) -> PathBuf {
+        self.tmp.path().join("ctl")
+    }
+
+    /// `mem` as a person at a terminal runs it: in the main root.
+    fn mem(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_mem"))
+            .args(args)
+            .current_dir(if self.m.exists() {
+                &self.m
+            } else {
+                self.tmp.path()
+            })
+            .env_clear()
+            .env("PATH", BARE_PATH)
+            .env("HOME", self.home())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("SHARDS_TMUX_SCOPE", "0")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    }
+
+    /// Start a shard on the default command and return its pane's
+    /// environment, exactly as the pane gave it to `claude`.
+    fn start(&self, id: &str, human: &str) -> BTreeMap<String, String> {
+        ok(&self.mem(&["shard", "start", "--id", id, "--human", human]));
+        let p = self.ctl().join(format!("env.{id}"));
+        let start = Instant::now();
+        while !p.exists() {
+            assert!(start.elapsed() < Duration::from_secs(5), "no env from {id}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let raw = std::fs::read(p).unwrap();
+        raw.split(|b| *b == 0)
+            .filter(|kv| !kv.is_empty())
+            .filter_map(|kv| {
+                let kv = String::from_utf8_lossy(kv);
+                kv.split_once('=').map(|(k, v)| (k.into(), v.into()))
+            })
+            .collect()
+    }
+
+    /// `mem` exactly as the shard's agent runs it: the pane's environment
+    /// and nothing more, in the pane's directory, found on the pane's PATH.
+    fn pane(&self, env: &BTreeMap<String, String>, args: &[&str]) -> Output {
+        Command::new("mem")
+            .args(args)
+            .current_dir(&env["PWD"])
+            .env_clear()
+            .envs(env)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    }
+
+    fn main_head(&self) -> String {
+        git(&self.m, &["rev-parse", "main"])
+    }
+}
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    let o = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    String::from_utf8_lossy(&o.stdout).trim().to_string()
+}
+
+fn ok(o: &Output) -> String {
+    assert!(
+        o.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+fn fails(o: &Output) -> String {
+    assert!(
+        !o.status.success(),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    String::from_utf8_lossy(&o.stderr).into_owned()
+}
+
+/// `claude` in `$HOME/.local/bin`: save the environment, run any script
+/// dropped at `ctl/run.<shard>` from inside the pane, and be the fake core.
+const STAND_IN: &str = r#"#!/bin/sh
+ctl=@CTL@
+env -0 > "$ctl/env.$SHARDS_SHARD"
+(
+  end=$(( $(date +%s) + 120 ))
+  while [ -d "$ctl" ] && [ "$(date +%s)" -lt "$end" ]; do
+    f="$ctl/run.$SHARDS_SHARD"
+    if [ -f "$f" ]; then
+      mv "$f" "$f.go"
+      sh "$f.go" > "$ctl/out.$SHARDS_SHARD" 2>&1
+      echo $? > "$ctl/rc.$SHARDS_SHARD"
+    fi
+    sleep 0.1
+  done
+) &
+exec sh @FAKE@ @TX@ "$ctl" "$@"
+"#;
+
+fn world() -> Option<World> {
+    if !tmux::available() {
+        eprintln!("tmux is not installed; skipping");
+        return None;
+    }
+    let tmp = TempDir::new().unwrap();
+    let m = tmp.path().join("m");
+    let w = World { m: m.clone(), tmp };
+    std::fs::create_dir_all(w.ctl()).unwrap();
+    let bin = w.home().join(".local").join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let fake = write_fake_core(&w.tmp.path().join("fake")).unwrap();
+    let tx = w.tmp.path().join("tx");
+    let claude = STAND_IN
+        .replace("@CTL@", &w.ctl().to_string_lossy())
+        .replace("@FAKE@", &fake.to_string_lossy())
+        .replace("@TX@", &tx.to_string_lossy());
+    std::fs::write(bin.join("claude"), claude).unwrap();
+    Command::new("chmod")
+        .arg("+x")
+        .arg(bin.join("claude"))
+        .status()
+        .unwrap();
+
+    ok(&w.mem(&["init", m.to_str().unwrap(), "--author", "core"]));
+    let root = std::fs::canonicalize(&m).unwrap();
+    let cc = w.tmp.path().join("claude.json");
+    std::fs::write(
+        &cc,
+        serde_json::json!({"projects": {root.to_string_lossy(): {"hasTrustDialogAccepted": true}}})
+            .to_string(),
+    )
+    .unwrap();
+    // `[shards] command` is left at its default, `claude`.
+    let toml = format!(
+        "[activity]\ntranscript_dir = \"{}\"\n[shards]\nsocket = \"{}\"\nclaude_config = \"{}\"\n",
+        tx.display(),
+        w.tmp.path().join("shards.sock").display(),
+        cc.display()
+    );
+    std::fs::write(m.join("shards.toml"), toml).unwrap();
+    git(
+        &m,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qam",
+            "test config",
+        ],
+    );
+    ok(&w.mem(&[
+        "set",
+        "devices/kiln-east/ip",
+        "10.0.4.40",
+        "--why",
+        "seed",
+        "--author",
+        "core",
+    ]));
+    Some(w)
+}
+
+#[test]
+fn the_default_claude_starts_from_home_local_bin_and_the_pane_knows_its_shard() {
+    let Some(w) = world() else { return };
+    let env = w.start("s1", "Ada");
+    let wt = std::fs::canonicalize(w.m.join(".shards/worktrees/s1")).unwrap();
+    assert_eq!(Path::new(&env["SHARDS_MEMORY"]), wt);
+    assert_eq!(Path::new(&env["PWD"]), wt);
+    assert_eq!(env["SHARDS_SHARD"], "s1");
+    assert_eq!(env["SHARDS_AUTHOR"], "s1");
+    assert_eq!(env["SHARDS_HUMAN"], "");
+    let path = &env["PATH"];
+    assert!(
+        path.contains(&*w.home().join(".local/bin").to_string_lossy()),
+        "{path}"
+    );
+    let mem_dir = Path::new(env!("CARGO_BIN_EXE_mem")).parent().unwrap();
+    assert!(path.contains(&*mem_dir.to_string_lossy()), "{path}");
+    assert!(ok(&w.mem(&["shard", "list"])).contains("pane: up"));
+}
+
+#[test]
+fn a_write_from_the_pane_stays_on_its_branch_until_dinit() {
+    let Some(w) = world() else { return };
+    let a = w.start("s1", "Ada");
+    let b = w.start("s2", "Basil");
+    let main0 = w.main_head();
+
+    // set, supersede and put from s1's pane, with no --author or --human.
+    let out = ok(&w.pane(
+        &a,
+        &[
+            "set",
+            "birds/heron/perch",
+            "north post",
+            "--why",
+            "seen there",
+        ],
+    ));
+    assert!(out.starts_with("set birds/heron/perch"), "{out}");
+    ok(&w.pane(
+        &a,
+        &[
+            "supersede",
+            "devices/kiln-east/ip",
+            "10.0.4.41",
+            "--why",
+            "new switch",
+        ],
+    ));
+    let note = Path::new(&a["PWD"]).join("visit.md");
+    std::fs::write(&note, "The heron came at dawn.\n").unwrap();
+    ok(&w.pane(
+        &a,
+        &[
+            "put",
+            "notes/visit.md",
+            note.to_str().unwrap(),
+            "--why",
+            "log",
+        ],
+    ));
+    std::fs::remove_file(&note).unwrap();
+
+    assert_eq!(w.main_head(), main0, "main moved");
+    let log = git(
+        &w.m,
+        &[
+            "log",
+            "--format=%an|%(trailers:key=Shards-Human,valueonly)",
+            "-3",
+            "shard/s1",
+        ],
+    );
+    for line in log.lines().filter(|l| !l.trim().is_empty()) {
+        assert!(line.starts_with("s1|Ada"), "{log}");
+    }
+
+    // s1 reads its own branch.
+    assert!(ok(&w.pane(&a, &["get", "birds/heron/perch"])).starts_with("north post\n"));
+    assert!(ok(&w.pane(&a, &["get", "devices/kiln-east/ip"])).starts_with("10.0.4.41\n"));
+    let h = ok(&w.pane(&a, &["history", "devices/kiln-east/ip"]));
+    assert!(h.contains("author: s1") && h.contains("human:  Ada"), "{h}");
+    let mut c = Command::new("mem")
+        .args(["resolve", "-"])
+        .current_dir(&a["PWD"])
+        .env_clear()
+        .envs(&a)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(
+        &mut c.stdin.take().unwrap(),
+        b"at {{fact:birds/heron/perch}}",
+    )
+    .unwrap();
+    assert_eq!(ok(&c.wait_with_output().unwrap()), "at north post");
+
+    // s2 and main can't see it.
+    fails(&w.pane(&b, &["get", "birds/heron/perch"]));
+    assert!(ok(&w.pane(&b, &["get", "devices/kiln-east/ip"])).starts_with("10.0.4.40\n"));
+    fails(&w.mem(&["get", "birds/heron/perch"]));
+
+    // The commands that need main still find it from the pane.
+    let board = ok(&w.pane(&b, &["board", "--json"]));
+    assert!(board.contains("birds/heron/perch"), "{board}");
+    assert!(ok(&w.pane(&b, &["shard", "list"])).contains("s1  human: Ada"));
+    ok(&w.pane(&b, &["shard", "status", "--id", "s2", "reading"]));
+    let ctx = ok(&w.pane(&b, &["core", "context"]));
+    assert!(ctx.contains("\"shards\""), "{ctx}");
+    assert!(ok(&w.pane(&b, &["core", "status"])).contains("core"));
+
+    // Dinit, from s2's pane: s1's work lands on main.
+    let out = ok(&w.pane(&b, &["dinit", "--id", "s1"]));
+    assert!(
+        out.contains("merged    facts/birds/heron/perch.md"),
+        "{out}"
+    );
+    assert!(out.contains("shard s1 closed"), "{out}");
+    assert_ne!(w.main_head(), main0);
+    assert!(ok(&w.mem(&["get", "birds/heron/perch"])).starts_with("north post\n"));
+    let h = ok(&w.mem(&["history", "birds/heron/perch"]));
+    assert!(h.contains("author: s1") && h.contains("human:  Ada"), "{h}");
+    // s2 branched before the dinit: still its own view until it dinits.
+    fails(&w.pane(&b, &["get", "birds/heron/perch"]));
+}
+
+#[test]
+fn the_same_fact_changed_in_two_panes_is_a_recorded_conflict() {
+    let Some(w) = world() else { return };
+    let a = w.start("s1", "Ada");
+    let b = w.start("s2", "Basil");
+    ok(&w.pane(
+        &a,
+        &[
+            "supersede",
+            "devices/kiln-east/ip",
+            "10.0.4.41",
+            "--why",
+            "A's switch",
+        ],
+    ));
+    ok(&w.pane(
+        &b,
+        &[
+            "supersede",
+            "devices/kiln-east/ip",
+            "10.0.4.99",
+            "--why",
+            "B's switch",
+        ],
+    ));
+    let main0 = w.main_head();
+    assert!(ok(&w.mem(&["get", "devices/kiln-east/ip"])).starts_with("10.0.4.40\n"));
+
+    let out = ok(&w.mem(&["dinit", "--id", "s1"]));
+    assert!(
+        out.contains("merged    facts/devices/kiln-east/ip.md"),
+        "{out}"
+    );
+    assert_ne!(w.main_head(), main0);
+    let out = ok(&w.pane(&b, &["dinit", "--id", "s2"]));
+    assert!(out.contains("CONFLICT  devices/kiln-east/ip"), "{out}");
+    assert!(out.contains("shard: 10.0.4.99  (by s2 / Basil"), "{out}");
+    assert!(ok(&w.mem(&["get", "devices/kiln-east/ip"])).starts_with("10.0.4.41\n"));
+    assert!(w.m.join("conflicts/s2/devices/kiln-east/ip.md").exists());
+}
+
+#[test]
+fn a_quirk_from_the_pane_goes_straight_to_main() {
+    let Some(w) = world() else { return };
+    let a = w.start("s1", "Ada");
+    let b = w.start("s2", "Basil");
+    let main0 = w.main_head();
+    let out = ok(&w.pane(
+        &a,
+        &[
+            "quirk",
+            "add",
+            "--tool",
+            "bandsaw-2",
+            "--quirk",
+            "loose handle",
+            "--by",
+            "Ada",
+        ],
+    ));
+    assert!(out.contains("q1"), "{out}");
+    assert_ne!(w.main_head(), main0, "a quirk goes to main");
+    assert!(ok(&w.pane(&b, &["quirk", "list"])).contains("loose handle"));
+    let h = ok(&w.pane(&b, &["quirk", "history", "q1"]));
+    assert!(h.contains("s1"), "{h}");
+}
+
+/// The shard's agent dinits its own shard: the merge lands, the shard
+/// closes, and only then does its session end.
+#[test]
+fn a_shard_dinits_itself_from_inside_its_pane() {
+    let Some(w) = world() else { return };
+    let a = w.start("s1", "Ada");
+    ok(&w.pane(
+        &a,
+        &[
+            "set",
+            "birds/heron/perch",
+            "north post",
+            "--why",
+            "seen there",
+        ],
+    ));
+    let main0 = w.main_head();
+    std::fs::write(w.ctl().join("run.s1"), "mem dinit --id s1\n").unwrap();
+
+    let start = Instant::now();
+    loop {
+        let list = ok(&w.mem(&["shard", "list"]));
+        if list.trim() == "no open shards"
+            && !Tmux::new(w.tmp.path().join("shards.sock"), "s1").has_session()
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "not closed: {list}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_ne!(w.main_head(), main0);
+    assert!(ok(&w.mem(&["get", "birds/heron/perch"])).starts_with("north post\n"));
+    assert!(!w.m.join(".shards/worktrees/s1").exists());
+    let out = std::fs::read_to_string(w.ctl().join("out.s1")).unwrap_or_default();
+    assert!(out.is_empty() || out.contains("dinit s1 -> main"), "{out}");
+}
