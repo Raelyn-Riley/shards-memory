@@ -660,7 +660,12 @@ impl Memory {
     /// shard's local state. A worktree with uncommitted changes is kept.
     fn close_shard(&self, meta: &ShardMeta, report: &mut DinitReport) -> Result<()> {
         // A shard is a session in a pane: end it before its worktree goes.
-        report.session_stopped = self.shard_session_end(meta);
+        // Unless this dinit runs in that very session (its agent ran `mem
+        // dinit`): ending the session ends this process, so close first.
+        let from_inside = self.inside_shard_pane(meta);
+        if !from_inside {
+            report.session_stopped = self.shard_session_end(meta);
+        }
         if meta.worktree.exists() {
             let wt = meta.worktree.to_string_lossy().to_string();
             if let Err(e) = self.git.run(&["worktree", "remove", &wt]) {
@@ -679,6 +684,11 @@ impl Memory {
         let _ = fs::remove_file(self.status_path(&meta.id));
         self.forget_activity(&meta.id);
         report.closed = true;
+        if from_inside {
+            // Last: this process is in the pane and may not outlive it.
+            report.session_stopped = true;
+            self.shard_session_end(meta);
+        }
         Ok(())
     }
 

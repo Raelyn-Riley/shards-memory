@@ -282,6 +282,32 @@ fn shell_line(env: &[(String, String)]) -> String {
     line
 }
 
+/// The parent of `pid`, from Linux `/proc` (elsewhere `ps`).
+fn parent_of(pid: u32) -> Option<u32> {
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        let rest = &stat[stat.rfind(')')? + 1..];
+        return rest.split_whitespace().nth(1)?.parse().ok();
+    }
+    let o = Command::new("ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&o.stdout).trim().parse().ok()
+}
+
+/// Is `ancestor` the parent, grandparent, ... of `pid`?
+pub fn is_ancestor(ancestor: u32, pid: u32) -> bool {
+    let mut p = pid;
+    for _ in 0..64 {
+        match parent_of(p) {
+            Some(q) if q == ancestor => return true,
+            Some(q) if q > 1 && q != p => p = q,
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// Child processes of `pid` (Linux `/proc`; elsewhere `ps`).
 pub fn children(pid: u32) -> Vec<u32> {
     let mut out = Vec::new();
