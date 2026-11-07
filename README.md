@@ -22,8 +22,8 @@ configured trigger fires. The reasoning core is one long-lived chat session in a
 pane, so it remembers what it has reasoned about. Built so far: facts, supersede,
 history, pointers, shards (each a session in its own pane), dinit, conflicts, soul
 approval, locks with lease-based crash recovery, the board, the watcher, the core
-session (pane wakes, watchdog, handoff, keep-warm), the known-quirks board, and a
-fake-data generator. Shard
+session (pane wakes, watchdog, handoff, keep-warm), the known-quirks board, notes
+with owners, and a fake-data generator. Shard
 inits and dinits (soul, profile, first message), bulletins, the drift checker and the
 web UI come later. See [`docs/design.md`](docs/design.md) for the
 design. Licensed AGPL-3.0-or-later.
@@ -73,6 +73,8 @@ Global: `-C, --memory <dir>` (or `SHARDS_MEMORY`) picks the memory and defaults 
 | `mem resolve [file\|-] [--annotate]` replaces every `{{fact:...}}` with the current value. `--annotate` gives `10.0.4.41 [devices/rotoforge-ctl/ip]`. Any unresolvable pointer is an error that names it. | `mem resolve notes/runbook.md --annotate` |
 | `mem gen-sample <dir> --seed N` builds a fake flock: 3 birds, 30 facts in 4 sections, 3 supersedes, 3 notes with pointers. The same seed gives byte-identical commits. | `mem gen-sample /tmp/flock --seed 7` |
 | `mem put <path> [file\|-] --why ...` writes a `notes/`, `people/` or `soul/` markdown file as one commit. Writing `soul/` on main needs an admin `--human`. | `mem put people/ada.md profile.md --why "prefers short answers"` |
+| `mem put <note> [file\|-] --for PERSON --why ...` writes the note into `notes/<person>/`. `notes/kiln.md` and `kiln.md` both become `notes/<person>/kiln.md`. Without `--for`, `notes/<file>.md` is a shared note, as before. | `mem put notes/kiln.md --for ada --why "vent tip"` |
+| `mem notes find <word> --for PERSON [--json]` searches every note for the word (any case, in its text or path). It lists that person's own notes first, then the shared notes, then everyone else's, newest first within each. Each result names whose note it is and its date. | `mem notes find kiln --for ada` |
 | `mem shard open --id <id> [--human <name>]` creates branch `shard/<id>` from main in its own worktree and prints the worktree path. | `cd "$(mem shard open --id s7 --human Ada)"` |
 | `mem shard start [--id <id>] --human <name>` opens a shard (as `shard open` does) and starts its session in its own pane, pinned to a session id. Blank for now: no first message. The id defaults to the first free `s<n>`. | `mem shard start --human Ada` |
 | `mem shard start --id <id> --resume` brings a stopped shard's pinned session back by its id. A no-op if it is running. | `mem shard start --id s7 --resume` |
@@ -707,6 +709,39 @@ to clean them up. Tidying them is left to a later scheduled core task.
 Seen on Claude Code 2.1.319 (haiku), with two real shards in a throwaway memory: shard A
 posted a quirk, and 25 s later shard B listed it with its branch still at its base. B
 then fixed it and A saw the fix on its next list.
+
+## Notes
+
+Notes are plain markdown under `notes/`. They are never facts. Nothing reads a note's
+text as a fact's value, and `mem notes find` never looks in `facts/`. Facts in a note
+are pointers (`{{fact:...}}`).
+
+- **Shared notes** sit at the top of `notes/`: `notes/runbook.md`.
+- **A person's own notes** sit in their folder: `notes/<person>/...`. The folder name is
+  the person, matched exactly, so `--for ada` and `--for Ada` are two folders. Any
+  folder under `notes/` counts as a person's.
+
+Notes are written like any other `notes/` file. In a shard they ride the shard's branch,
+and `mem dinit` merges them with no core review, the same as before. A note changed in
+two shards is a conflict like any other.
+
+`mem notes find` reads HEAD of the memory it is pointed at. From a shard's pane that is
+the shard's branch: its own notes plus main's as of when it opened. A note's date is the
+author date of the newest commit that changed it, which is the write's own timestamp.
+
+```text
+$ mem notes find kiln --for basil
+notes/basil/kiln.md  (basil's own note, 2026-11-06)
+    Basil: kiln shelf cracked.
+notes/runbook.md  (shared note, 2026-11-02)
+    Check the kiln vent.
+notes/ada/kiln.md  (ada's note, 2026-11-05)
+    Kiln east runs hot.
+```
+
+Up to three matching lines are shown per note. A note that matches only by its path
+shows none. `--json` gives the same list as `[{"path", "owner": {"kind": "shared"} |
+{"kind": "person", "person"}, "rank": "own" | "shared" | "other", "date", "lines"}]`.
 
 ## Config: `shards.toml`
 
