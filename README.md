@@ -551,7 +551,10 @@ matters and hands off to a fresh session.
 
 **Start.** `mem core start` creates a tmux session on the core's **own socket**
 (`[core] socket`, default `.shards/core/tmux.sock`), so nothing in your own tmux can
-touch it. The pane runs a plain shell with `SHARDS_MEMORY` set. The core's command
+touch it. The pane runs a plain shell with `SHARDS_MEMORY` set, and the same `PATH` as a
+shard's pane (`mem`'s directory, plus `~/.local/bin` and `~/bin` when they exist), so
+a bare `claude` and `mem` start from `mem core start`, the watchdog and `rinit` even
+when the core's tmux server has a bare `PATH`. The core's command
 (`[core] command`, default `claude`) is typed into that shell in `[core] cwd`, which
 defaults to the memory root. Its first message tells it to read `soul/` and run
 `mem core context`. The message is written to `.shards/core/first-message.md` and passed
