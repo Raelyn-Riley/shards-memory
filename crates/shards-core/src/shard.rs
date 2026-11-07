@@ -443,7 +443,7 @@ impl Memory {
             ..Default::default()
         };
         let human = meta.human.as_deref();
-        let _shard_lock = main.lock_shard(id, id, human)?;
+        let shard_lock = main.lock_shard(id, id, human)?;
 
         // Which paths might we touch? (Stable: only dinit moves the base,
         // and we hold the shard lock.)
@@ -646,7 +646,14 @@ impl Memory {
             .run(&["ls-files", "--", &format!("conflicts/{id}/")])?;
         if report.conflicts.is_empty() && meta.soul_pending.is_empty() {
             if open_records.trim().is_empty() {
-                main.close_shard(&meta, &mut report)?;
+                if main.close_shard(&meta, &mut report)? {
+                    // Run from inside the shard's own session: that session
+                    // is waiting on this very command, so it can't take
+                    // `/exit`. Everything is done; let go of the shard lock
+                    // and end the session, and this process with it.
+                    drop(shard_lock);
+                    main.shard_session_end_from_inside(&meta);
+                }
             } else {
                 report.kept_open = Some(format!(
                     "it still has open conflicts under conflicts/{id}/ (settle with mem resolve-conflict)"
@@ -658,7 +665,9 @@ impl Memory {
 
     /// After a clean dinit: remove the worktree, maybe the branch, and the
     /// shard's local state. A worktree with uncommitted changes is kept.
-    fn close_shard(&self, meta: &ShardMeta, report: &mut DinitReport) -> Result<()> {
+    /// True if the shard closed but its session is still to be ended,
+    /// because this dinit runs inside that session (see `dinit`).
+    fn close_shard(&self, meta: &ShardMeta, report: &mut DinitReport) -> Result<bool> {
         // A shard is a session in a pane: end it before its worktree goes.
         // Unless this dinit runs in that very session (its agent ran `mem
         // dinit`): ending the session ends this process, so close first.
@@ -673,7 +682,7 @@ impl Memory {
                     "worktree {} was not removed (uncommitted changes?): {e}",
                     meta.worktree.display()
                 ));
-                return Ok(());
+                return Ok(false);
             }
         }
         if !self.config.shards.keep_branches {
@@ -684,12 +693,8 @@ impl Memory {
         let _ = fs::remove_file(self.status_path(&meta.id));
         self.forget_activity(&meta.id);
         report.closed = true;
-        if from_inside {
-            // Last: this process is in the pane and may not outlive it.
-            report.session_stopped = true;
-            self.shard_session_end(meta);
-        }
-        Ok(())
+        report.session_stopped |= from_inside;
+        Ok(from_inside)
     }
 
     /// Open conflict records on main for `target` (an address, or a

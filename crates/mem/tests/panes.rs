@@ -447,6 +447,15 @@ fn a_shard_dinits_itself_from_inside_its_pane() {
     assert_ne!(w.main_head(), main0);
     assert!(ok(&w.mem(&["get", "birds/heron/perch"])).starts_with("north post\n"));
     assert!(!w.m.join(".shards/worktrees/s1").exists());
+    assert!(
+        !w.m.join(".shards/locks/shard.s1.lock").exists(),
+        "shard lock left behind"
+    );
+    let log = std::fs::read_to_string(w.m.join(".shards/sessions/sessions.log")).unwrap();
+    assert!(
+        log.contains("s1: its own clean dinit closed it; session ended"),
+        "{log}"
+    );
     let out = std::fs::read_to_string(w.ctl().join("out.s1")).unwrap_or_default();
     assert!(out.is_empty() || out.contains("dinit s1 -> main"), "{out}");
 }

@@ -592,6 +592,19 @@ impl Memory {
             .is_some_and(|p| tmux::is_ancestor(p.pid, std::process::id()))
     }
 
+    /// End the shard's session from inside it, after a clean dinit its own
+    /// agent ran. The agent is busy waiting on that command, so `/exit`
+    /// can't land: close the tmux session, which ends the agent and this
+    /// process. Logged first, since nothing runs after.
+    pub(crate) fn shard_session_end_from_inside(&self, meta: &ShardMeta) {
+        let Ok(sp) = self.shard_pane(meta) else {
+            return;
+        };
+        self.session_log(&meta.id, "its own clean dinit closed it; session ended");
+        let _ = fs::remove_file(self.sessions_dir().join(format!("{}.lock", meta.id)));
+        sp.pane.tmux.kill_session();
+    }
+
     pub(crate) fn shard_session_end(&self, meta: &ShardMeta) -> bool {
         let Ok(sp) = self.shard_pane(meta) else {
             return false;
