@@ -13,6 +13,7 @@
 //! `mem dinit` inside the pane itself. Without tmux the tests pass with a note.
 //!
 //! Brief 09 adds notes with owners and `[intervals]`, run the same way.
+//! Brief 10 adds people in any case and a shard finding main's newer notes.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -594,4 +595,141 @@ fn intervals_are_read_from_the_main_root_by_a_pane() {
         "{}",
         archive(&w)
     );
+}
+
+/// Brief 10, from a shard's pane: a person in any case is one folder, and
+/// `notes find` sees notes merged to main after the shard opened, with the
+/// shard's own version of a note that is on both.
+#[test]
+fn a_pane_finds_main_notes_merged_after_it_opened_and_people_match_in_any_case() {
+    let Some(w) = world() else { return };
+    let a = w.start("s1", "Ada");
+
+    // After s1 opened: Basil's shard writes and merges, and a folder named
+    // DAVE/ by hand reaches main.
+    let b = w.start("s2", "Basil");
+    let out = put_from_pane(
+        &w,
+        &b,
+        "kiln.md",
+        "Basil: kiln shelf cracked.\n",
+        &["--for", "Basil"],
+    );
+    assert!(out.starts_with("wrote notes/basil/kiln.md"), "{out}");
+    put_from_pane(
+        &w,
+        &b,
+        "notes/runbook.md",
+        "Kiln key is in the drawer.\n",
+        &[],
+    );
+    put_from_pane(
+        &w,
+        &b,
+        "notes/DAVE/lathe.md",
+        "Kiln and lathe share a fuse.\n",
+        &[],
+    );
+    let out = ok(&w.mem(&["dinit", "--id", "s2"]));
+    assert!(out.contains("shard s2 closed"), "{out}");
+
+    // s1 writes as Ada in two cases, as dave, and its own runbook.
+    let out = put_from_pane(
+        &w,
+        &a,
+        "notes/kiln.md",
+        "Kiln east runs hot.\n",
+        &["--for", "Ada"],
+    );
+    assert!(out.starts_with("wrote notes/ada/kiln.md"), "{out}");
+    let out = put_from_pane(
+        &w,
+        &a,
+        "notes/ADA/vent.md",
+        "Kiln vent left.\n",
+        &["--for", "ADA"],
+    );
+    assert!(out.starts_with("wrote notes/ada/vent.md"), "{out}");
+    let out = put_from_pane(&w, &a, "kiln.md", "Dave: kiln timer.\n", &["--for", "dave"]);
+    assert!(out.starts_with("wrote notes/DAVE/kiln.md"), "{out}");
+    put_from_pane(&w, &a, "notes/runbook.md", "Kiln key: ask Ada.\n", &[]);
+
+    let day = |rev: &str, p: &str| git(&w.m, &["log", "-1", "--format=%as", rev, "--", p]);
+    for who in ["ada", "Ada", "ADA"] {
+        let out = ok(&w.pane(&a, &["notes", "find", "kiln", "--for", who]));
+        let paths: Vec<&str> = out
+            .lines()
+            .filter(|l| !l.starts_with(' '))
+            .map(|l| l.split("  ").next().unwrap())
+            .collect();
+        // Own, shared, then everyone else's. (Writes here can share a
+        // second, so order within a group is not checked.)
+        let group = |r: std::ops::Range<usize>| {
+            let mut g = paths[r].to_vec();
+            g.sort();
+            g
+        };
+        assert_eq!(paths.len(), 6, "{who}: {out}");
+        assert_eq!(
+            group(0..2),
+            ["notes/ada/kiln.md", "notes/ada/vent.md"],
+            "{out}"
+        );
+        assert_eq!(paths[2], "notes/runbook.md", "{out}");
+        assert_eq!(
+            group(3..6),
+            [
+                "notes/DAVE/kiln.md",
+                "notes/DAVE/lathe.md",
+                "notes/basil/kiln.md"
+            ],
+            "{out}"
+        );
+        assert!(
+            out.contains("notes/ada/vent.md  (ada's own note, "),
+            "{out}"
+        );
+        // The runbook once, the shard's version and date.
+        assert_eq!(out.matches("notes/runbook.md").count(), 1, "{out}");
+        assert!(out.contains("Kiln key: ask Ada."), "{out}");
+        assert!(!out.contains("drawer"), "{out}");
+        assert!(
+            out.contains(&format!(
+                "notes/runbook.md  (shared note, {})",
+                day("shard/s1", "notes/runbook.md")
+            )),
+            "{out}"
+        );
+        // Basil's, from main only, with main's date.
+        assert!(
+            out.contains(&format!(
+                "notes/basil/kiln.md  (basil's note, {})",
+                day("main", "notes/basil/kiln.md")
+            )),
+            "{out}"
+        );
+    }
+    // Dave in any case owns DAVE/.
+    let out = ok(&w.pane(&a, &["notes", "find", "kiln", "--for", "Dave"]));
+    assert!(
+        out.contains("notes/DAVE/kiln.md  (DAVE's own note, "),
+        "{out}"
+    );
+    assert!(
+        out.contains("notes/DAVE/lathe.md  (DAVE's own note, "),
+        "{out}"
+    );
+
+    // Main still sees only main.
+    let out = ok(&w.mem(&["notes", "find", "kiln", "--for", "ada"]));
+    assert!(!out.contains("notes/ada/"), "{out}");
+
+    // At dinit dave's note joins DAVE/, no second folder; the runbook,
+    // changed on both, is a conflict like any other.
+    let out = ok(&w.mem(&["dinit", "--id", "s1"]));
+    assert!(out.contains("merged    notes/DAVE/kiln.md"), "{out}");
+    assert!(out.contains("CONFLICT  notes/runbook.md"), "{out}");
+    let tree = git(&w.m, &["ls-tree", "-d", "--name-only", "main", "notes/"]);
+    let dirs: Vec<&str> = tree.lines().collect();
+    assert_eq!(dirs, ["notes/DAVE", "notes/ada", "notes/basil"], "{tree}");
 }

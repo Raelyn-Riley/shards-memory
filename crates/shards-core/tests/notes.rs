@@ -177,3 +177,220 @@ fn a_persons_note_rides_the_shard_branch_and_merges_at_dinit() {
     assert_eq!(hits[0].path, "notes/ada/kiln.md");
     assert_eq!(hits[0].day(), "2026-11-06");
 }
+
+// Brief 10: a person matches in any case; a shard reads main's notes too.
+
+fn put(mem: &Memory, person: Option<&str>, path: &str, text: &str, t: &str) -> String {
+    // In a shard the author is the shard id (left empty here).
+    let who = if mem.context() == &Context::Main {
+        "core"
+    } else {
+        ""
+    };
+    mem.put_note_as(person, path, text, &at(who, t)).unwrap().0
+}
+
+#[test]
+fn a_person_is_the_same_in_any_case() {
+    let (_t, mem) = fresh();
+    // No folder yet: a new one is lowercase, whatever case is given.
+    let t = "2026-11-01T09:00:00Z";
+    assert_eq!(
+        put(&mem, Some("Dave"), "kiln.md", "kiln a\n", t),
+        "notes/dave/kiln.md"
+    );
+    assert_eq!(
+        put(&mem, Some("DAVE"), "vent.md", "kiln b\n", t),
+        "notes/dave/vent.md"
+    );
+    assert_eq!(
+        put(&mem, Some("dAvE"), "notes/Dave/shelf.md", "kiln c\n", t),
+        "notes/dave/shelf.md"
+    );
+    // An existing folder keeps its case.
+    mem.put_file("notes/MINA/old.md", "kiln d\n", &at("core", t))
+        .unwrap();
+    assert_eq!(
+        put(&mem, Some("mina"), "kiln.md", "kiln e\n", t),
+        "notes/MINA/kiln.md"
+    );
+    assert_eq!(
+        put(&mem, Some("Mina"), "notes/mina/x.md", "kiln f\n", t),
+        "notes/MINA/x.md"
+    );
+    assert_eq!(mem.note_folder("MiNa").unwrap(), "MINA");
+    // A folder that only starts with the name is someone else.
+    mem.put_file("notes/minato/a.md", "kiln g\n", &at("core", t))
+        .unwrap();
+    assert_eq!(mem.note_folder("mina").unwrap(), "MINA");
+
+    // find: --for in any case ranks the folder in any case as own.
+    for who in ["mina", "Mina", "MINA"] {
+        let hits = mem.find_notes("kiln", who).unwrap();
+        let own: Vec<&str> = hits
+            .iter()
+            .filter(|h| h.rank == Rank::Own)
+            .map(|h| h.path.as_str())
+            .collect();
+        assert_eq!(own.len(), 3, "{who}: {own:?}");
+        assert!(own.iter().all(|p| p.starts_with("notes/MINA/")), "{own:?}");
+        assert_eq!(hits[0].owner, Owner::Person("MINA".into()));
+    }
+    let hits = mem.find_notes("kiln", "DAVE").unwrap();
+    assert_eq!(hits.iter().filter(|h| h.rank == Rank::Own).count(), 3);
+
+    // Two folders that differ only by case (written by hand before brief 10):
+    // both are the person's; a put goes to the one spelled as given, else the
+    // first by name.
+    mem.put_file("notes/Dave/hand.md", "kiln h\n", &at("core", t))
+        .unwrap();
+    assert_eq!(mem.note_folder("Dave").unwrap(), "Dave");
+    assert_eq!(mem.note_folder("dave").unwrap(), "dave");
+    assert_eq!(mem.note_folder("DAVE").unwrap(), "Dave");
+    let hits = mem.find_notes("kiln", "dave").unwrap();
+    assert_eq!(hits.iter().filter(|h| h.rank == Rank::Own).count(), 4);
+}
+
+#[test]
+fn a_shard_finds_notes_merged_to_main_after_it_opened() {
+    let (_t, mem) = fresh();
+    put(
+        &mem,
+        None,
+        "notes/runbook.md",
+        "kiln key on the hook\n",
+        "2026-11-01T09:00:00Z",
+    );
+    put(
+        &mem,
+        Some("ada"),
+        "gone.md",
+        "kiln old shelf\n",
+        "2026-11-01T09:00:00Z",
+    );
+    let s1 = shard(&mem, "s1", "Ada");
+    let s2 = shard(&mem, "s2", "Basil");
+
+    // After s1 opened: s2 writes and merges; main is also written directly.
+    put(
+        &s2,
+        Some("Basil"),
+        "kiln.md",
+        "kiln east: left vent\n",
+        "2026-11-05T10:00:00Z",
+    );
+    put(
+        &s2,
+        None,
+        "notes/runbook.md",
+        "kiln key moved to the drawer\n",
+        "2026-11-05T10:00:00Z",
+    );
+    assert!(mem.dinit("s2", false).unwrap().conflicts.is_empty());
+    put(
+        &mem,
+        Some("ada"),
+        "timer.md",
+        "kiln timer reset\n",
+        "2026-11-04T10:00:00Z",
+    );
+    put(
+        &mem,
+        None,
+        "notes/shop.md",
+        "kiln gloves\n",
+        "2026-11-03T10:00:00Z",
+    );
+
+    // s1 edits the shared runbook (also changed on main) and adds its own.
+    put(
+        &s1,
+        None,
+        "notes/runbook.md",
+        "kiln key: ask Ada\n",
+        "2026-11-06T10:00:00Z",
+    );
+    put(
+        &s1,
+        Some("ADA"),
+        "shelf.md",
+        "kiln shelf cracked\n",
+        "2026-11-06T11:00:00Z",
+    );
+    // And deletes one of hers that was there when it opened.
+    let g = std::process::Command::new("git")
+        .current_dir(s1.root())
+        .envs(env())
+        .args(["rm", "-q", "notes/ada/gone.md"])
+        .status()
+        .unwrap();
+    assert!(g.success());
+    let g = std::process::Command::new("git")
+        .current_dir(s1.root())
+        .envs(env())
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@x",
+            "commit",
+            "-qm",
+            "rm",
+        ])
+        .status()
+        .unwrap();
+    assert!(g.success());
+
+    let hits = s1.find_notes("kiln", "Ada").unwrap();
+    let got: Vec<(&str, Rank, &str)> = hits
+        .iter()
+        .map(|h| (h.path.as_str(), h.rank, h.day()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("notes/ada/shelf.md", Rank::Own, "2026-11-06"),
+            ("notes/ada/timer.md", Rank::Own, "2026-11-04"),
+            ("notes/runbook.md", Rank::Shared, "2026-11-06"),
+            ("notes/shop.md", Rank::Shared, "2026-11-03"),
+            ("notes/basil/kiln.md", Rank::Other, "2026-11-05"),
+        ]
+    );
+    // The runbook counts once, with the shard's text.
+    assert_eq!(hits[2].lines, ["kiln key: ask Ada"]);
+
+    // Main alone is unchanged: it never sees s1's branch.
+    let on_main: Vec<String> = mem
+        .find_notes("kiln", "ada")
+        .unwrap()
+        .into_iter()
+        .map(|h| h.path)
+        .collect();
+    assert!(!on_main.contains(&"notes/ada/shelf.md".to_string()));
+    assert!(on_main.contains(&"notes/ada/gone.md".to_string()));
+}
+
+#[test]
+fn a_shard_puts_into_a_folder_that_reached_main_after_it_opened() {
+    let (_t, mem) = fresh();
+    let s1 = shard(&mem, "s1", "Ada");
+    mem.put_file(
+        "notes/JUN/lathe.md",
+        "chuck stiff\n",
+        &at("core", "2026-11-02T09:00:00Z"),
+    )
+    .unwrap();
+    assert_eq!(
+        put(
+            &s1,
+            Some("jun"),
+            "kiln.md",
+            "kiln note\n",
+            "2026-11-03T09:00:00Z"
+        ),
+        "notes/JUN/kiln.md"
+    );
+    let r = mem.dinit("s1", false).unwrap();
+    assert_eq!(r.merged, ["notes/JUN/kiln.md"]);
+    assert!(r.conflicts.is_empty());
+}
