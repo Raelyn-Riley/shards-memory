@@ -85,7 +85,7 @@ Global: `-C, --memory <dir>` (or `SHARDS_MEMORY`) picks the memory and defaults 
 | `mem resolve-conflict <address\|path.md> --take shard\|main\|<value> --why ... [--shard <id>]` settles a recorded conflict on main. | `mem resolve-conflict devices/ctl/ip --take shard --why "s7's switch is live"` |
 | `mem soul approve <shard-id> --human <admin>` writes a shard's pending soul proposal to main. Admins only. | `mem soul approve s7 --human Ada` |
 | `mem board [--json]` shows every open shard (human, state, pane, gist, last activity, facts in flight, last few actions), then overlaps, open conflicts and soul proposals. Takes no lock. | `mem board --json` |
-| `mem watch [--once]` evaluates the triggers every `poll_secs`, records events and wakes the core. `--once` runs one pass and exits. | `mem watch --once` |
+| `mem watch [--once]` evaluates the triggers every `[intervals] watch_poll_secs`, records events and wakes the core. `--once` runs one pass and exits. | `mem watch --once` |
 | `mem core context` prints `mem board --json` and the pending events as one JSON document: everything a woken core needs. | `mem core context` |
 | `mem core start [--resume]` starts the core in its own tmux pane with a first message, and pins its session id. A no-op if it is running. `--resume` resumes the pinned session instead of starting a fresh one. | `mem core start` |
 | `mem core status [--json]` shows whether the pane is up and the command alive, the pinned session, the last wake, the watchdog and keep-warm. | `mem core status` |
@@ -100,7 +100,7 @@ Global: `-C, --memory <dir>` (or `SHARDS_MEMORY`) picks the memory and defaults 
 | `mem quirk update <id> --status S --by PERSON` sets the status in words and reopens the quirk. The old status stays in history. | `mem quirk update q3 --status "worse when cold" --by Jim` |
 | `mem quirk fix <id> --by PERSON` sets the status to "fixed by PERSON" and starts the archive clock. | `mem quirk fix q3 --by Ada` |
 | `mem quirk mention <id> [--by PERSON]` records that a quirk came up again. This resets the archive clock, and an archived quirk goes back to fixed. | `mem quirk mention q3` |
-| `mem quirk archive [--days N]` archives fixed quirks with no fix or mention in N days (default `[quirks] archive_after_days`). | `mem quirk archive` |
+| `mem quirk archive [--days N]` archives fixed quirks with no fix or mention in N days (default `[intervals] quirk_archive_days`, 90). | `mem quirk archive` |
 | `mem quirk history <id>` lists every version, newest first: time, commit, op, who, and the shard that wrote it. | `mem quirk history q3` |
 
 ## Shards
@@ -277,10 +277,10 @@ human, pid, host, acquired time, lease expiry and a nonce.
   "check if stale, break it, take it", two waiters can never both break the same stale
   lock.
 - **Blocked writers.** A blocked writer is told `locked by <holder> (<human>) since
-  <time>`. In wait mode it then polls with backoff until `timeout_secs`. It is not a
+  <time>`. In wait mode it then polls with backoff until `lock_timeout_secs`. It is not a
   strict FIFO queue. In fail mode it exits non-zero at once.
 - **Heartbeat and lease.** A holder's background thread renews the lease every
-  `lease_secs / 3`.
+  `lock_lease_secs / 3`.
 - **Recovery.** A lock is recovered only if its lease has expired **and** its pid is gone
   on this host (a zombie counts as gone). A lock from another host is never broken
   automatically. Each recovery is appended to `.shards/lock.log` and told to the writer
@@ -444,7 +444,7 @@ change.
 
 ### The watcher: `mem watch`
 
-`mem watch` runs a pass every `[awareness] poll_secs`. It re-reads `shards.toml` before
+`mem watch` runs a pass every `[intervals] watch_poll_secs`. It re-reads `shards.toml` before
 each pass. `mem watch --once` runs one pass and exits, so a systemd timer or cron can
 drive it. The watcher never calls a model itself. If a pass fails, the error is printed
 and the watcher keeps going.
@@ -500,7 +500,7 @@ so every current condition fires once.
   recorded and stay pending, and nothing runs.
 
 In command mode, if `[wake] command` is set, a pass may wake the core. It does so when events are
-pending and the last wake was at least `cooldown_secs` ago. The cooldown is 0 by
+pending and the last wake was at least `core_cooldown_secs` ago. The cooldown is 0 by
 default, so core reasoning isn't rate-limited unless you set one; dedupe still applies.
 The pass then runs the
 command with `sh -c` in the memory root, and gives it:
@@ -509,7 +509,7 @@ command with `sh -c` in the memory root, and gives it:
 - `SHARDS_MEMORY` set to the memory root in its environment.
 
 The command's stdout and stderr go to the watcher's. The command may run for up to
-`timeout_secs`. After that it is killed, along with its whole process group.
+`wake_timeout_secs`. After that it is killed, along with its whole process group.
 
 - **Success** (exit 0): those events are delivered and leave the pending list.
 - **Failure or timeout**: a line goes to `.shards/wake.log`, the events stay pending,
@@ -534,8 +534,10 @@ chooses. For example (not run by anything in this repo, and never in tests):
 # the board, then decide which humans should talk to each other." \
 #   --allowedTools "Bash(mem core context)" >> "$SHARDS_MEMORY/.shards/core.log"
 # """
-timeout_secs = 300
-cooldown_secs = 0
+
+[intervals]
+wake_timeout_secs = 300
+core_cooldown_secs = 0
 ```
 
 ### The core session
@@ -575,8 +577,8 @@ so the line is kept short and the text and Enter are sent as two separate tmux c
 Before Enter, the pass checks that the text shows in the pane. After Enter, it checks
 that a new prompt (or a queued prompt) appears in the core's transcript. A line that
 never shows is not entered, and the events wait for the next pass. A line that was
-entered but isn't seen in the transcript within `land_timeout_secs` counts as woken,
-and is reported and logged as unconfirmed. A `cooldown_secs`, if you set one, applies
+entered but isn't seen in the transcript within `core_land_timeout_secs` counts as woken,
+and is reported and logged as unconfirmed. A `core_cooldown_secs`, if you set one, applies
 to pane wakes too.
 
 **Ack.** A pane wake doesn't take events off the pending list. The core runs
@@ -696,7 +698,7 @@ root with no `--author`, quirk commands use `SHARDS_SHARD` when it is set.
 - `open`: what `add` and `update` set. An open quirk is never archived.
 - `fixed`: what `fix` sets.
 - `archived`: what `archive` sets on a fixed quirk whose later fix or mention is older
-  than N days. N comes from `--days` or `[quirks] archive_after_days`, default 30.
+  than N days. N comes from `--days` or `[intervals] quirk_archive_days`, default 90.
 - A mention resets the clock. A mention of an archived quirk puts it back to `fixed`.
 
 **Duplicates** are allowed. Two reports of the same thing get two ids, and no human has
@@ -711,14 +713,29 @@ then fixed it and A saw the fix on its next list.
 `shards.toml` sits at the memory root. `mem init` writes the defaults, and every key is
 optional. Unknown keys are an error, so a typo doesn't silently fall back to a default.
 The file is read fresh by every `mem` run, so a change takes effect without any code
-edit.
+edit. A shard's pane reads the main root's `shards.toml`, not its worktree's copy.
+
+Every duration lives in one `[intervals]` section:
 
 ```toml
+[intervals]
+lock_timeout_secs = 30        # how long a waiting writer waits for a lock
+lock_lease_secs = 30          # lock lifetime without a heartbeat; a dead holder's lock is recovered after this
+idle_secs = 600               # no shard activity this long: idle
+stale_secs = 3600             # no shard activity this long: stale
+watch_poll_secs = 30          # how often mem watch runs a pass
+wake_timeout_secs = 300       # how long a wake command may run
+core_cooldown_secs = 0        # wake the core at most once per this long; 0: no limit
+core_start_timeout_secs = 60  # a start, resume or handoff must come up (and pin) in this long
+core_exit_timeout_secs = 30   # the session must exit this soon after /exit
+core_land_timeout_secs = 10   # a typed line must show in the pane / transcript this soon
+                              # (these three timeouts apply to shard sessions too)
+keep_warm_mins = 50           # keep-warm pings an idle core after this long
+quirk_archive_days = 90       # mem quirk archive: fixed and not mentioned for this long
+
 [lock]
 scope = "section"     # "store": one lock for main | "section": one per top-level section
-when_busy = "wait"    # "wait": queue up to timeout_secs | "fail": fail fast
-timeout_secs = 30     # how long a waiting writer waits
-lease_secs = 30       # lock lifetime without a heartbeat; a dead holder's lock is recovered after this
+when_busy = "wait"    # "wait": queue up to lock_timeout_secs | "fail": fail fast
 
 [soul]
 admins = ["Ada", "Basil"]   # humans who may approve soul changes
@@ -735,11 +752,6 @@ claude_config = ""                 # empty: $CLAUDE_CONFIG_DIR/.claude.json or ~
 source = "claude-code"  # "claude-code": read session transcripts | "none": git only
 transcript_dir = ""     # empty: $CLAUDE_CONFIG_DIR/projects or ~/.claude/projects
 
-[awareness]
-idle_secs = 600         # no activity this long: idle
-stale_secs = 3600       # no activity this long: stale
-poll_secs = 30          # how often mem watch runs a pass
-
 [triggers]              # each on or off
 same_fact = true
 same_section = false
@@ -750,8 +762,6 @@ soul_proposal = true
 [wake]
 mode = "auto"           # "auto": pane once mem core start has run, else command | "command" | "pane"
 command = ""            # command mode: empty records events and runs nothing
-timeout_secs = 300
-cooldown_secs = 0       # wake the core at most once per this long; 0: no limit
 
 [core]
 command = "claude"      # typed into the core's pane by mem core start
@@ -760,17 +770,30 @@ socket = ".shards/core/tmux.sock"  # the core's own tmux server
 session = "core"
 cwd = ""                # empty: the memory root
 watchdog = true         # mem watch restores a dead core and resumes its pinned session
-start_timeout_secs = 60 # a start, resume or handoff must come up (and pin) in this long
-exit_timeout_secs = 30  # the core must exit this soon after /exit
-land_timeout_secs = 10  # a typed line must show in the pane / transcript this soon
-                        # (these three timeouts apply to shard sessions too)
 keep_warm = false       # ping an idle core with [HH:MM] (for measuring)
-keep_warm_mins = 50
-keep_warm_quiet_limit = 8
-
-[quirks]                # optional; not written by mem init
-archive_after_days = 30 # mem quirk archive: fixed and not mentioned for this long
+keep_warm_quiet_limit = 8  # a count, so it stays here
 ```
+
+**Older configs keep working.** Each duration is still read from where it used to
+live. If a setting is in both places, `[intervals]` wins, wherever the two sit in the
+file.
+
+| `[intervals]` | old place |
+|---|---|
+| `lock_timeout_secs` | `[lock] timeout_secs` |
+| `lock_lease_secs` | `[lock] lease_secs` |
+| `idle_secs` | `[awareness] idle_secs` |
+| `stale_secs` | `[awareness] stale_secs` |
+| `watch_poll_secs` | `[awareness] poll_secs` |
+| `wake_timeout_secs` | `[wake] timeout_secs` |
+| `core_cooldown_secs` | `[wake] cooldown_secs` |
+| `core_start_timeout_secs` | `[core] start_timeout_secs` |
+| `core_exit_timeout_secs` | `[core] exit_timeout_secs` |
+| `core_land_timeout_secs` | `[core] land_timeout_secs` |
+| `keep_warm_mins` | `[core] keep_warm_mins` |
+| `quirk_archive_days` | `[quirks] archive_after_days` (the default was 30; it is now 90) |
+
+The `shards.toml` that `mem init` writes still uses the old places.
 
 Local state that is never committed lives in `.shards/`: `worktrees/`, `shards/`
 (shard records), `status/`, `locks/`, `lock.log`, `activity/` (per-shard activity
