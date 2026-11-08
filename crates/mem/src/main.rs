@@ -14,8 +14,8 @@ use shards_core::coresession::Landed;
 use shards_core::shardsession::ShardLaunch;
 use shards_core::{
     resolve, sample, Address, CoreStatus, DinitReport, Memory, NewQuirk, Owner, PassReport,
-    Provenance, Quirk, QuirkState, Rank, ResolveOptions, ShardMeta, ShardStart, Side, StartReport,
-    Take, UsageEntry, WakeOutcome,
+    Proposal, Provenance, Quirk, QuirkState, Rank, ResolveOptions, ShardMeta, ShardStart, Side, StartReport,
+    Take, UsageEntry, Verdict, WakeOutcome,
 };
 
 #[derive(Parser)]
@@ -135,6 +135,10 @@ enum Cmd {
     /// Soul proposals.
     #[command(subcommand)]
     Soul(SoulCmd),
+    /// A shard's fact and people changes, waiting for the core: list, show,
+    /// and accept, reject or hold each change.
+    #[command(subcommand)]
+    Proposal(ProposalCmd),
     /// What every open shard is doing, read from git and its transcript.
     Board {
         /// Machine-readable output (format documented in the README).
@@ -227,6 +231,60 @@ enum SoulCmd {
         author: Option<String>,
         #[arg(long, default_value = "")]
         why: String,
+    },
+}
+
+#[derive(clap::Args)]
+struct Decide {
+    /// The proposal, e.g. p3.
+    id: String,
+    /// Decide only this change (default: every change still open).
+    #[arg(long)]
+    change: Option<usize>,
+    /// Why: required, and logged with the decision for good.
+    #[arg(long)]
+    why: Option<String>,
+    /// The reviewer (default: core).
+    #[arg(long, env = "SHARDS_AUTHOR")]
+    author: Option<String>,
+    /// A human deciding (required for a held change).
+    #[arg(long, env = "SHARDS_HUMAN")]
+    human: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum ProposalCmd {
+    /// Proposals with a change still pending or held (--all: every one).
+    List {
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Every change in a proposal, its value, reason and status, and every decision.
+    Show {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Accept: write the change to main. With --value, accept that value
+    /// instead (a fix; the record keeps both).
+    Accept {
+        #[command(flatten)]
+        d: Decide,
+        /// The fixed value to accept instead of the proposed one; `-` reads stdin.
+        #[arg(long)]
+        value: Option<String>,
+    },
+    /// Reject: main stays as it is.
+    Reject {
+        #[command(flatten)]
+        d: Decide,
+    },
+    /// Hold for a human: main stays as it is until a human decides.
+    Hold {
+        #[command(flatten)]
+        d: Decide,
     },
 }
 
@@ -401,6 +459,13 @@ fn print_dinit(out: &mut impl Write, r: &DinitReport) -> io::Result<()> {
     for p in &r.merged {
         writeln!(out, "  merged    {p}")?;
     }
+    for p in &r.proposed {
+        writeln!(
+            out,
+            "  PROPOSED  {p}  ({}: waits for the core, not on main yet)",
+            r.proposal.as_deref().unwrap_or("?")
+        )?;
+    }
     for p in &r.unchanged {
         writeln!(out, "  same      {p}")?;
     }
@@ -523,6 +588,106 @@ fn print_board(out: &mut impl Write, b: &Board) -> io::Result<()> {
                 p.paths.join(", ")
             )?;
         }
+    }
+    if !b.proposals.is_empty() {
+        writeln!(out, "\nproposals (mem proposal show <id>):")?;
+        for p in &b.proposals {
+            let pending: Vec<&str> = p
+                .changes
+                .iter()
+                .filter(|c| c.status == "pending" || c.status == "held")
+                .map(|c| c.target.as_str())
+                .collect();
+            writeln!(
+                out,
+                "  {}  from {} ({})  {} pending, {} held  {}",
+                p.id,
+                p.shard,
+                p.human.as_deref().unwrap_or("-"),
+                p.pending,
+                p.held,
+                pending.join(", ")
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn print_proposal(out: &mut impl Write, p: &Proposal) -> io::Result<()> {
+    writeln!(
+        out,
+        "{}  from shard {} ({})  made {}",
+        p.id,
+        p.shard,
+        p.human.as_deref().unwrap_or("no human"),
+        p.created
+    )?;
+    let one = |v: &Option<String>| match v {
+        Some(v) => v.replace('\n', " ⏎ "),
+        None => "(none)".to_string(),
+    };
+    for c in &p.changes {
+        writeln!(out)?;
+        writeln!(
+            out,
+            "  #{}  {}  {}  [{}]",
+            c.n,
+            c.op.as_str(),
+            c.target(),
+            c.status.as_str()
+        )?;
+        writeln!(out, "      proposed: {}", one(&c.value))?;
+        writeln!(out, "      main had: {}", one(&c.main_value))?;
+        writeln!(
+            out,
+            "      why:      {}",
+            if c.why.is_empty() {
+                "(no reason given)"
+            } else {
+                &c.why
+            }
+        )?;
+        if let Some(v) = &c.accepted_value {
+            if Some(v) != c.value.as_ref() {
+                writeln!(out, "      accepted: {} (fixed)", v.replace('\n', " ⏎ "))?;
+            }
+        }
+        if let Some(r) = &c.conflict_record {
+            writeln!(out, "      conflict: {r} (mem resolve-conflict)")?;
+        }
+    }
+    if !p.log.is_empty() {
+        writeln!(out, "\n  decisions:")?;
+        for d in &p.log {
+            writeln!(
+                out,
+                "    {}  #{} {}  by {}{}: {}{}",
+                d.at,
+                d.change,
+                d.action,
+                d.by,
+                d.human.as_deref().map(|h| format!(" / {h}")).unwrap_or_default(),
+                d.why,
+                d.value
+                    .as_deref()
+                    .map(|v| format!("  (value: {})", v.replace('\n', " ⏎ ")))
+                    .unwrap_or_default()
+            )?;
+        }
+    }
+    let open: Vec<String> = p
+        .changes
+        .iter()
+        .filter(|c| c.status.is_open())
+        .map(|c| c.n.to_string())
+        .collect();
+    if !open.is_empty() {
+        writeln!(
+            out,
+            "\n  open: #{}  (mem proposal accept|reject|hold {} [--change N] --why \"...\")",
+            open.join(", #"),
+            p.id
+        )?;
     }
     Ok(())
 }
@@ -1061,6 +1226,81 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 "approved soul change from {shard} ({})",
                 short(&commit)
             )?;
+        }
+        Cmd::Proposal(cmd) => {
+            let mem = Memory::open(&cli.memory)?;
+            let (d, verdict) = match cmd {
+                ProposalCmd::List { all, json } => {
+                    let list: Vec<Proposal> = mem
+                        .proposals()?
+                        .into_iter()
+                        .filter(|p| all || p.is_open())
+                        .collect();
+                    if json {
+                        writeln!(out, "{}", serde_json::to_string_pretty(&list)?)?;
+                    } else if list.is_empty() {
+                        writeln!(out, "no {}proposals", if all { "" } else { "open " })?;
+                    }
+                    for p in list.iter().filter(|_| !json) {
+                        let targets: Vec<String> = p
+                            .changes
+                            .iter()
+                            .map(|c| format!("#{} {} [{}]", c.n, c.target(), c.status.as_str()))
+                            .collect();
+                        writeln!(
+                            out,
+                            "{}  from {} ({})  {}  {}",
+                            p.id,
+                            p.shard,
+                            p.human.as_deref().unwrap_or("-"),
+                            p.created,
+                            targets.join(", ")
+                        )?;
+                    }
+                    return Ok(());
+                }
+                ProposalCmd::Show { id, json } => {
+                    let p = mem.proposal(&id)?;
+                    if json {
+                        writeln!(out, "{}", serde_json::to_string_pretty(&p)?)?;
+                    } else {
+                        print_proposal(&mut out, &p)?;
+                    }
+                    return Ok(());
+                }
+                ProposalCmd::Accept { d, value } => {
+                    let v = value.map(read_value).transpose()?;
+                    (d, Verdict::Accept(v))
+                }
+                ProposalCmd::Reject { d } => (d, Verdict::Reject),
+                ProposalCmd::Hold { d } => (d, Verdict::Hold),
+            };
+            // A shard's pane sets SHARDS_SHARD: its agent proposes, never decides.
+            if let Some(s) = given(std::env::var("SHARDS_SHARD").ok()) {
+                return Err(format!(
+                    "shard {s} can't decide proposals; the core reviews them on main"
+                )
+                .into());
+            }
+            let p = Provenance::new(
+                d.author.unwrap_or_default(),
+                given(d.human),
+                d.why.unwrap_or_default(),
+            );
+            let r = mem.proposal_decide(&d.id, d.change, &verdict, &p)?;
+            for (n, target, status, record) in &r.changes {
+                writeln!(
+                    out,
+                    "{} #{n} {target}: {}{}",
+                    r.id,
+                    status.as_str(),
+                    record
+                        .as_deref()
+                        .map(|rec| format!(" (main changed it first; record {rec}, settle with mem resolve-conflict)"))
+                        .unwrap_or_default()
+                )?;
+            }
+            writeln!(out, "logged on main ({})", short(&r.commit))?;
         }
         Cmd::Board { json } => {
             let mem = Memory::open(&cli.memory)?;
