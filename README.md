@@ -13,15 +13,16 @@ that history.
 All reads and writes go through one small tool, `mem`, which is a thin CLI over the
 `shards-core` library. Each session works in a *shard*: a whole agent session running
 in its own tmux pane, on its own branch and git worktree. When the person is done the
-shard *dinits*, and its work is merged into
-`main` under a lock. If a shard and main both changed the same fact, the conflict is
+shard *dinits*. Its notes merge into `main` under a lock. Its fact and people changes
+become one *proposal* that the core reviews change by change, because the core decides
+facts and people. If a shard and main both changed the same fact, the conflict is
 recorded for a human, never guessed. A soul change waits for a human admin. The core
 knows what every shard is doing without asking: `mem board` reads it from git and from
 each shard's agent transcript, and `mem watch` wakes a reasoning core only when a
 configured trigger fires. The reasoning core is one long-lived chat session in a tmux
 pane, so it remembers what it has reasoned about. Built so far: facts, supersede,
-history, pointers, shards (each a session in its own pane), dinit, conflicts, soul
-approval, locks with lease-based crash recovery, the board, the watcher, the core
+history, pointers, shards (each a session in its own pane), dinit, proposals,
+conflicts, soul approval, locks with lease-based crash recovery, the board, the watcher, the core
 session (pane wakes, watchdog, handoff, keep-warm), the known-quirks board, notes
 with owners, and a fake-data generator. Shard
 inits and dinits (soul, profile, first message), bulletins, the drift checker and the
@@ -67,7 +68,7 @@ Global: `-C, --memory <dir>` (or `SHARDS_MEMORY`) picks the memory and defaults 
 | --- | --- |
 | `mem init <dir>` creates a new memory (`facts/`, `soul/`, `people/`, README, `.gitignore`, a default `shards.toml`, first commit). | `mem init ~/flock-memory` |
 | `mem get <address>` prints the value, then `home: <path>`. An unknown address exits 1. | `mem get devices/rotoforge-ctl/ip` |
-| `mem set <address> <value> --why ...` creates a **new** fact. It refuses only an exact existing address (use `supersede`). Near-duplicates such as the same name elsewhere are left to the later drift checker, which flags them for a human. | `mem set devices/rotoforge-ctl/ip 10.0.4.40 --why "first seen on the bench"` |
+| `mem set <address> <value> --why ...` creates a **new** fact. Every fact and people write needs a `--why`; without one it is refused with a message telling the agent to say why. It refuses only an exact existing address (use `supersede`). Near-duplicates such as the same name elsewhere are left to the later drift checker, which flags them for a human. | `mem set devices/rotoforge-ctl/ip 10.0.4.40 --why "first seen on the bench"` |
 | `mem supersede <address> <value> --why ...` replaces an existing fact's value as one commit that touches only that file. | `mem supersede devices/rotoforge-ctl/ip 10.0.4.41 --why "moved to the new switch"` |
 | `mem history <address>` shows every version, newest first: time, commit, author, human, why and value. | `mem history devices/rotoforge-ctl/ip` |
 | `mem resolve [file\|-] [--annotate]` replaces every `{{fact:...}}` with the current value. `--annotate` gives `10.0.4.41 [devices/rotoforge-ctl/ip]`. Any unresolvable pointer is an error that names it. | `mem resolve notes/runbook.md --annotate` |
@@ -83,7 +84,12 @@ Global: `-C, --memory <dir>` (or `SHARDS_MEMORY`) picks the memory and defaults 
 | `mem shard send --id <id> <text\|->` types one message into the shard's pane and confirms it in that session's transcript. | `mem shard send --id s7 "hello"` |
 | `mem shard list [--json]` lists open shards: human, pane (`up`, `shell`, `down`), pinned session, base commit, last commit time and status line. | `mem shard list` |
 | `mem shard status --id <id> "<gist>"` sets the shard's one-line status. | `mem shard status --id s7 "moving the controller"` |
-| `mem dinit --id <id> [--all-or-nothing]` merges the shard into main under the lock and reports what was merged, conflicted, proposed or skipped. A clean dinit stops the shard's session before it closes the shard. | `mem dinit --id s7` |
+| `mem dinit --id <id> [--all-or-nothing]` merges the shard's notes into main under the lock, puts its fact and people changes in one proposal for the core, and reports what was merged, proposed, conflicted or skipped. A clean dinit stops the shard's session before it closes the shard. | `mem dinit --id s7` |
+| `mem proposal list [--all] [--json]` lists proposals with a change still pending or held. `--all` lists every one. | `mem proposal list` |
+| `mem proposal show <id> [--json]` shows each change (op, target, proposed value, main's value, the shard's reason, status) and every decision. | `mem proposal show p3` |
+| `mem proposal accept <id> [--change N] [--value V] --why ...` writes the change(s) to main. `--value` accepts a fixed value instead; the record keeps both. | `mem proposal accept p3 --change 2 --value 10.0.4.42 --why "the switch says .42"` |
+| `mem proposal reject <id> [--change N] --why ...` leaves main as it is. | `mem proposal reject p3 --change 1 --why "the vent stays shut"` |
+| `mem proposal hold <id> [--change N] --why ...` leaves main as it is and waits for a human; deciding a held change needs `--human`. | `mem proposal hold p3 --change 3 --why "ask Ada"` |
 | `mem resolve-conflict <address\|path.md> --take shard\|main\|<value> --why ... [--shard <id>]` settles a recorded conflict on main. | `mem resolve-conflict devices/ctl/ip --take shard --why "s7's switch is live"` |
 | `mem soul approve <shard-id> --human <admin>` writes a shard's pending soul proposal to main. Admins only. | `mem soul approve s7 --human Ada` |
 | `mem board [--json]` shows every open shard (human, state, pane, gist, last activity, facts in flight, last few actions), then overlaps, open conflicts and soul proposals. Takes no lock. | `mem board --json` |
@@ -133,7 +139,7 @@ session and the attach command.
   *worktree*, so `mem set`, `supersede` and `put` run by the shard's agent commit to
   `shard/<id>` (under the shard lock), and `get`, `history` and `resolve` read the
   shard's own branch. Main doesn't move and other shards don't see the work until
-  `mem dinit`. `dinit`, `board`, `shard ...`, `core ...` and `quirk ...` find main from
+  `mem dinit` (notes) or until the core accepts it (facts and people). `dinit`, `board`, `shard ...`, `core ...` and `quirk ...` find main from
   the worktree, and quirks still go straight to main.
 - **Stamped without guessing.** The pane sets `SHARDS_SHARD` and `SHARDS_AUTHOR` to the
   shard id and clears `SHARDS_HUMAN`, so nothing inherited from whoever started the
@@ -204,7 +210,8 @@ main lock(s). It looks at every file changed on the shard since its base
 
 | File | What happens |
 | --- | --- |
-| `facts/`, `people/`, `notes/`, changed only on the shard | Applied to main. |
+| `notes/`, changed only on the shard | Applied to main, with no review. Notes are never facts. |
+| `facts/`, `people/`, changed only on the shard | **Proposed.** Not applied. Every such change goes into one proposal record, `proposals/p<n>.json`, which the core reviews. See [Proposals](#proposals). |
 | `facts/`, `people/`, `notes/`, changed on the shard **and** on main since the base | **Conflict.** Main's version stays. A record goes to `conflicts/s7/<address>.md` (non-fact files: `conflicts/s7/@/<path>`) with both values, authors, humans, times and whys. The other files still merge unless `--all-or-nothing` is given, in which case nothing is written. |
 | `facts/`, `people/`, `notes/`, identical on both sides | Nothing to do. |
 | `soul/` | Never merged automatically. Reported as a **proposal** that waits for `mem soul approve`. |
@@ -222,7 +229,9 @@ commits become ancestors of main:
   to a conflicted fact conflict again.
 
 **When the shard closes.** A dinit is clean when it has no conflicts, no pending soul
-proposal and no open records under `conflicts/<id>/`. A clean dinit removes the shard's
+proposal and no open records under `conflicts/<id>/`. A pending fact proposal doesn't
+keep a shard open: its record holds every value and reason, and the shard's commits are
+ancestors of main from the dinit on. A clean dinit removes the shard's
 worktree (one with uncommitted changes is kept and reported). It keeps or deletes the
 branch per `[shards] keep_branches`, then drops the shard from `mem shard list`.
 Otherwise the shard stays open until its conflicts and proposals are settled.
@@ -233,6 +242,59 @@ session is busy waiting on the command and can't take `/exit`. So dinit closes t
 shard first, then lets go of the shard lock, logs it, and closes the shard's tmux
 session, which ends the agent and `mem` with it. The agent never sees the report; it is
 in `.shards/sessions/sessions.log` and in main's history.
+
+### Proposals
+
+The core decides facts and people, so a shard's fact and people changes are a
+proposal. Dinit writes them as one record, `proposals/p<n>.json`, committed to main in
+the dinit's own merge commit. The record lists each change:
+
+- `n` (1-based) and `op`: `set`, `supersede`, `put` (a `people/` file) or `remove`;
+- the path and the fact address;
+- the proposed `value` and `main_value`, main's value when the proposal was made;
+- the shard's `why`, its `author` (the shard id) and when it made the change;
+- `status`: `pending`, `held`, `accepted`, `rejected` or `conflict`.
+
+The record also names the shard, its human, the time, main's commit at the dinit and
+the shard's tip.
+
+**Reviewing.** The core decides each change, or every open change at once without
+`--change`:
+
+- **Accept** writes the change to main under the lock. A fact keeps the shard's
+  `author`, `human` and `why`, and gets `proposal` (`p3#2`), `reviewed_by` and
+  `review_why`. `mem history` shows both reasons. The commit adds `Shards-Proposal`,
+  `Shards-Shard`, `Shards-Shard-Human`, `Shards-Change` and `Shards-Shard-Why`
+  trailers, and its `Shards-Why` is the reviewer's reason.
+- **Fix:** `accept --change N --value V` writes `V` instead. The record keeps the
+  proposed `value` and the `accepted_value`.
+- **Conflict:** if main changed the path since the proposal was made, an accept
+  writes nothing to the fact. It records a conflict at `conflicts/<shard>/...`, the
+  same record a dinit writes, and the change's status becomes `conflict`. Settle it
+  with `mem resolve-conflict`.
+- **Reject** leaves main alone.
+- **Hold** leaves main alone and waits for a human. Accepting or rejecting a held
+  change needs `--human`.
+
+A decision is final, and every decision needs a `--why`. Each one is a commit on main
+that rewrites the record with the new status and appends to its `log`: the time, the
+change, the action (`accept`, `fix`, `reject`, `hold`, `conflict`), who, the human and
+the reason. Nothing is removed, and git keeps every earlier version. Nothing is
+accepted automatically, and there is no small-change path.
+
+The reviewer defaults to `core` and runs on main. A shard can't decide: deciding is
+refused from a shard's worktree, from any pane with `SHARDS_SHARD` set, and for the
+proposing shard's own id.
+
+Telling the person about a rejection isn't built yet. The record already holds what it
+needs: the shard, its human, the change, the shard's reason and the reviewer's reason.
+
+Seen on Claude Code 2.1.319 (haiku), in a throwaway memory with fake data. A shard
+ran `mem set --help`, then `mem set kiln/east/shelf ... --why "..."`, then
+`mem dinit --id s1`. Main didn't have the fact, and `mem watch --once` woke the core.
+The core ran `mem core context` and `mem proposal show p1`, then
+`mem proposal accept p1 --change 1 --why "..."`. The fact was then on main with both
+reasons, and the core acked the event.
 
 ### Conflicts
 
@@ -261,7 +323,7 @@ also needs an admin `--human`.
 Only one writer changes main at a time:
 
 - `set`, `supersede`, `put` and `resolve-conflict` on main take the main lock(s), and so
-  do `soul approve` and every `dinit`.
+  do `soul approve`, every `dinit` and every proposal decision.
 - Each shard's own writes take a per-shard lock (`shard.<id>`). Dinit takes the shard
   lock first, then the main lock(s), so a shard can't commit mid-dinit.
 - With `scope = "section"`, the main lock is per top-level section: `main.facts.<section>`,
@@ -391,7 +453,8 @@ overlaps:
 - **`same-section`**: two or more open shards are in flight in the same top-level
   section (a fact's first address segment, or `people` or `notes`).
 
-Open conflict records on main and pending soul proposals are listed under the overlaps.
+Open conflict records on main, pending soul proposals, and fact/people proposals with a
+change pending or held are listed under the overlaps.
 
 Reading the board never takes the main lock or a shard lock, so it never blocks a
 writer. It runs only read-only git commands, with `GIT_OPTIONAL_LOCKS=0` so that
@@ -440,7 +503,14 @@ change.
   }],
   "conflicts": [{ "shard": "s3", "target": "network/dns",
                   "record": "conflicts/s3/network/dns.md", "humans": ["Ada", "Cleo"] }],
-  "soul_proposals": [{ "shard": "s4", "human": "Dov", "paths": ["soul/voice.md"] }]
+  "soul_proposals": [{ "shard": "s4", "human": "Dov", "paths": ["soul/voice.md"] }],
+  "proposals": [{                              // fact/people proposals with a change pending or held
+    "id": "p3", "shard": "s5", "human": "Basil",
+    "created": "2026-11-04T22:40:00Z",
+    "pending": 1, "held": 1,
+    "changes": [{ "n": 1, "op": "supersede", "target": "kiln/east/temp", "status": "pending" },
+                { "n": 2, "op": "put", "target": "people/basil.md", "status": "held" }]
+  }]
 }
 ```
 
@@ -460,6 +530,7 @@ A pass builds the board and checks the **triggers** that are switched on:
 | `stale_with_work` | a shard is `stale` with at least one fact in flight | `stale-with-work:<id>` |
 | `open_conflict` | a conflict record exists on main | `open-conflict:<record path>` |
 | `soul_proposal` | a shard has a pending soul proposal | `soul-proposal:<id>:<paths>` |
+| `proposal` | a fact/people proposal has a change pending (not held) | `proposal:<id>` |
 
 When a condition starts to hold, one **event** is appended to `.shards/events.jsonl`
 and added to the pending list:
@@ -802,6 +873,7 @@ same_section = false
 stale_with_work = true  # stale shard with facts in flight
 open_conflict = true
 soul_proposal = true
+proposal = true         # a shard's fact/people proposal waits for the core
 
 [wake]
 mode = "auto"           # "auto": pane once mem core start has run, else command | "command" | "pane"
@@ -868,6 +940,8 @@ why: "moved to the new switch"
   value is a double-quoted string with JSON escaping, which is also valid YAML.
 - `updated` is RFC 3339 UTC, written by the tool. It is never edited by hand.
 - `human` is omitted when no human is known. `author`, `human` and `why` are single-line.
+- A fact accepted from a proposal adds `proposal: "p3#2"`, `reviewed_by` and
+  `review_why` after `why`. `author`, `human` and `why` stay the shard's.
 - The body is the value followed by exactly one newline. Values may span several lines.
 - Unknown front-matter keys are ignored when reading.
 
@@ -888,12 +962,17 @@ Shards-Why: moved to the new switch
   - `set` and `supersede`: the address, plus a `Shards-Address` trailer.
   - `put`: the path, plus `Shards-Path`.
   - `dinit`: the shard id. This is the merge commit, with one line of counts and the
-    trailers `Shards-Shard`, `Shards-Merged`, `Shards-Conflict` and `Shards-Proposal`
-    (one per path).
+    trailers `Shards-Shard`, `Shards-Merged`, `Shards-Proposal-Id` and
+    `Shards-Proposed` (a fact/people proposal), `Shards-Conflict`, and
+    `Shards-Proposal` (a soul path), one per path.
   - `resolve-conflict`: the target, plus `Shards-Target`, `Shards-Shard` and
     `Shards-Take`.
   - `soul-approve`: the shard id, plus `Shards-Shard`, `Shards-Approved-By` and
     `Shards-From-Commit`.
+  - `proposal-accept`, `proposal-reject` and `proposal-hold`: the proposal id, plus
+    `Shards-Proposal`, `Shards-Shard`, `Shards-Shard-Human`, and for each change
+    decided a `Shards-Change` (`<n> <target>`) and a `Shards-Shard-Why`
+    (`<n>: <reason>`).
 - The body is git trailers, so `git log --format='%(trailers:key=Shards-Why,valueonly)'`
   works. `Shards-Human` is omitted when there is no human.
 - The git author and committer are both the shard: name `<author>`, email
