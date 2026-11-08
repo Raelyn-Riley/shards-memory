@@ -231,3 +231,38 @@ fn rinit_starts_claude_from_home_local_bin_on_a_bare_path() {
     let new = w.session_id();
     assert_ne!(new, id);
 }
+
+/// Brief 12: a shard's dinit leaves a proposal, and the next watch pass
+/// wakes the core in its pane, as an open conflict does.
+#[test]
+fn a_new_proposal_wakes_the_core_in_its_pane() {
+    let Some(w) = world() else { return };
+    w.start();
+    let wt = ok(&w.mem(&["shard", "open", "--id", "s1", "--human", "Basil"]));
+    let wt = wt.trim();
+    ok(&w.mem(&[
+        "-C",
+        wt,
+        "supersede",
+        "devices/kiln-east/ip",
+        "10.0.4.41",
+        "--why",
+        "new switch",
+        "--author",
+        "s1",
+    ]));
+    let out = ok(&w.mem(&["dinit", "--id", "s1"]));
+    assert!(
+        out.contains("PROPOSED  facts/devices/kiln-east/ip.md  (p1"),
+        "{out}"
+    );
+    let out = ok(&w.mem(&["watch", "--once"]));
+    assert!(out.contains("event 1 proposal: shard s1 (Basil)"), "{out}");
+    assert!(
+        out.contains("woke the core in its pane: 1 event(s) up to #1"),
+        "{out}"
+    );
+    let ctx = ok(&w.mem(&["core", "context"]));
+    assert!(ctx.contains("\"kind\": \"proposal\""), "{ctx}");
+    assert!(ctx.contains("\"proposals\""), "{ctx}");
+}

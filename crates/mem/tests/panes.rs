@@ -742,3 +742,180 @@ fn a_pane_finds_main_notes_merged_after_it_opened_and_people_match_in_any_case()
     let dirs: Vec<&str> = tree.lines().collect();
     assert_eq!(dirs, ["notes/DAVE", "notes/ada", "notes/basil"], "{tree}");
 }
+
+/// Brief 12: from a pane, a fact needs a reason; at dinit the note lands and
+/// the facts and profile wait in a proposal; the core reviews each change.
+#[test]
+fn a_pane_proposes_and_the_core_reviews_each_change() {
+    let Some(w) = world() else { return };
+    let a = w.start("s1", "Ada");
+    let b = w.start("s2", "Basil");
+
+    // No reason: refused, with a message telling the agent to say why.
+    let e = fails(&w.pane(&a, &["set", "birds/heron/perch", "north post"]));
+    assert!(e.contains("--why") && e.contains("saying why"), "{e}");
+    let e = fails(&w.pane(
+        &a,
+        &[
+            "supersede",
+            "devices/kiln-east/ip",
+            "10.0.4.41",
+            "--why",
+            " ",
+        ],
+    ));
+    assert!(e.contains("saying why"), "{e}");
+
+    ok(&w.pane(
+        &a,
+        &[
+            "set",
+            "birds/heron/perch",
+            "north post",
+            "--why",
+            "seen there",
+        ],
+    ));
+    ok(&w.pane(
+        &a,
+        &[
+            "supersede",
+            "devices/kiln-east/ip",
+            "10.0.4.41",
+            "--why",
+            "new switch",
+        ],
+    ));
+    put_from_pane(&w, &a, "people/ada.md", "Likes short answers.\n", &[]);
+    put_from_pane(&w, &a, "notes/visit.md", "The heron came at dawn.\n", &[]);
+
+    // Dinit from s2's pane: the note lands, the rest waits.
+    let out = ok(&w.pane(&b, &["dinit", "--id", "s1"]));
+    assert!(out.contains("merged    notes/visit.md"), "{out}");
+    for p in [
+        "facts/birds/heron/perch.md",
+        "facts/devices/kiln-east/ip.md",
+        "people/ada.md",
+    ] {
+        assert!(out.contains(&format!("PROPOSED  {p}  (p1")), "{out}");
+    }
+    assert!(w.m.join("notes/visit.md").exists());
+    fails(&w.mem(&["get", "birds/heron/perch"]));
+    assert!(ok(&w.mem(&["get", "devices/kiln-east/ip"])).starts_with("10.0.4.40\n"));
+    assert!(!w.m.join("people/ada.md").exists());
+
+    // The board and the core's context show it, from main and from a pane.
+    let board = ok(&w.mem(&["board"]));
+    assert!(
+        board.contains("p1  from s1 (Ada)  3 pending, 0 held"),
+        "{board}"
+    );
+    let ctx = ok(&w.pane(&b, &["core", "context"]));
+    assert!(
+        ctx.contains("\"proposals\"") && ctx.contains("\"p1\""),
+        "{ctx}"
+    );
+    // The watcher fires a proposal event.
+    let watch = ok(&w.mem(&["watch", "--once"]));
+    assert!(
+        watch.contains("proposal: shard s1 (Ada) proposes 3 change(s) in p1"),
+        "{watch}"
+    );
+    let list = ok(&w.pane(&b, &["proposal", "list"]));
+    assert!(list.contains("p1  from s1 (Ada)"), "{list}");
+
+    // A shard's agent can't decide, not even pointed at main.
+    let e = fails(&w.pane(&b, &["proposal", "accept", "p1", "--why", "fine"]));
+    assert!(e.contains("can't decide proposals"), "{e}");
+    let root = w.m.to_str().unwrap();
+    let e = fails(&w.pane(
+        &b,
+        &["-C", root, "proposal", "accept", "p1", "--why", "fine"],
+    ));
+    assert!(e.contains("can't decide proposals"), "{e}");
+    // A decision without a reason is refused.
+    let e = fails(&w.mem(&["proposal", "reject", "p1", "--change", "1"]));
+    assert!(e.contains("saying why"), "{e}");
+
+    let show = ok(&w.mem(&["proposal", "show", "p1"]));
+    for needle in [
+        "#1  set  birds/heron/perch  [pending]",
+        "#2  supersede  devices/kiln-east/ip  [pending]",
+        "proposed: 10.0.4.41",
+        "main had: 10.0.4.40",
+        "why:      new switch",
+        "#3  put  people/ada.md  [pending]",
+    ] {
+        assert!(show.contains(needle), "{needle} not in\n{show}");
+    }
+
+    // Per change: accept, fix, hold, then a human rejects the held one.
+    let out = ok(&w.mem(&[
+        "proposal",
+        "accept",
+        "p1",
+        "--change",
+        "1",
+        "--why",
+        "seen it too",
+    ]));
+    assert!(out.contains("p1 #1 birds/heron/perch: accepted"), "{out}");
+    ok(&w.mem(&[
+        "proposal",
+        "accept",
+        "p1",
+        "--change",
+        "2",
+        "--value",
+        "10.0.4.42",
+        "--why",
+        "the switch gave it .42",
+    ]));
+    ok(&w.mem(&[
+        "proposal",
+        "hold",
+        "p1",
+        "--change",
+        "3",
+        "--why",
+        "ask Ada herself",
+    ]));
+    assert!(ok(&w.mem(&["board"])).contains("0 pending, 1 held"));
+    let e = fails(&w.mem(&["proposal", "reject", "p1", "--change", "3", "--why", "no"]));
+    assert!(e.contains("held for a human"), "{e}");
+    ok(&w.mem(&[
+        "proposal",
+        "reject",
+        "p1",
+        "--change",
+        "3",
+        "--why",
+        "Ada says no",
+        "--human",
+        "Ada",
+    ]));
+
+    assert!(ok(&w.mem(&["get", "birds/heron/perch"])).starts_with("north post\n"));
+    assert!(ok(&w.mem(&["get", "devices/kiln-east/ip"])).starts_with("10.0.4.42\n"));
+    assert!(!w.m.join("people/ada.md").exists());
+    let h = ok(&w.mem(&["history", "devices/kiln-east/ip"]));
+    for needle in [
+        "author: s1",
+        "human:  Ada",
+        "why:    new switch",
+        "review: core accepted it from p1#2: the switch gave it .42",
+    ] {
+        assert!(h.contains(needle), "{needle} not in\n{h}");
+    }
+    let show = ok(&w.mem(&["proposal", "show", "p1"]));
+    for needle in [
+        "proposed: 10.0.4.41",
+        "accepted: 10.0.4.42 (fixed)",
+        "#3 hold  by core: ask Ada herself",
+        "#3 reject  by core / Ada: Ada says no",
+    ] {
+        assert!(show.contains(needle), "{needle} not in\n{show}");
+    }
+    assert!(ok(&w.mem(&["proposal", "list"])).contains("no open proposals"));
+    assert!(ok(&w.mem(&["proposal", "list", "--all"])).contains("p1"));
+}
