@@ -69,6 +69,8 @@ pub enum EventKind {
     StaleWithWork,
     OpenConflict,
     SoulProposal,
+    /// A shard's fact/people proposal waits for the core.
+    Proposal,
     /// The core watchdog gave up restoring the core.
     CoreDown,
 }
@@ -81,6 +83,7 @@ impl EventKind {
             EventKind::StaleWithWork => "stale-with-work",
             EventKind::OpenConflict => "open-conflict",
             EventKind::SoulProposal => "soul-proposal",
+            EventKind::Proposal => "proposal",
             EventKind::CoreDown => "core-down",
         }
     }
@@ -203,6 +206,35 @@ pub fn conditions(board: &Board, t: &TriggersConfig) -> Vec<Condition> {
                     p.shard,
                     p.paths.join(", ")
                 ),
+            });
+        }
+    }
+    if t.proposal {
+        for p in board.proposals.iter().filter(|p| p.pending > 0) {
+            let targets: Vec<String> = p
+                .changes
+                .iter()
+                .filter(|c| c.status == "pending")
+                .map(|c| c.target.clone())
+                .collect();
+            out.push(Condition {
+                kind: EventKind::Proposal,
+                key: format!("proposal:{}", p.id),
+                shards: vec![p.shard.clone()],
+                humans: p.human.iter().cloned().collect(),
+                summary: format!(
+                    "shard {}{} proposes {} change(s) in {} ({}); review with mem proposal show {}",
+                    p.shard,
+                    p.human
+                        .as_deref()
+                        .map(|h| format!(" ({h})"))
+                        .unwrap_or_default(),
+                    p.pending,
+                    p.id,
+                    targets.join(", "),
+                    p.id
+                ),
+                addresses: targets,
             });
         }
     }

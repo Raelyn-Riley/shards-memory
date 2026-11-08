@@ -13,7 +13,8 @@
 //! - the optional gist from `mem shard status`.
 //!
 //! Then it computes **overlaps** between shards (`same-fact`,
-//! `same-section`) and lists open conflicts and pending soul proposals.
+//! `same-section`) and lists open conflicts, pending soul proposals and
+//! the fact/people proposals with changes still to decide.
 //!
 //! Reading the board never takes a main or shard lock and never blocks a
 //! writer: it only reads git (with `GIT_OPTIONAL_LOCKS=0`, so `git status`
@@ -153,6 +154,30 @@ pub struct SoulProposal {
     pub paths: Vec<String>,
 }
 
+/// One change in an open proposal, as the board shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProposalChangeRow {
+    pub n: usize,
+    pub op: String,
+    /// Fact address, or the `people/` path.
+    pub target: String,
+    pub status: String,
+}
+
+/// A fact/people proposal with a change still pending or held.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProposalRow {
+    pub id: String,
+    pub shard: String,
+    pub human: Option<String>,
+    pub created: String,
+    /// Changes waiting for the core.
+    pub pending: usize,
+    /// Changes held for a human.
+    pub held: usize,
+    pub changes: Vec<ProposalChangeRow>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Thresholds {
     pub idle_secs: f64,
@@ -171,6 +196,8 @@ pub struct Board {
     pub overlaps: Vec<Overlap>,
     pub conflicts: Vec<OpenConflict>,
     pub soul_proposals: Vec<SoulProposal>,
+    /// Fact/people proposals with a change pending or held, oldest first.
+    pub proposals: Vec<ProposalRow>,
 }
 
 fn rfc3339(t: DateTime<Utc>) -> String {
@@ -376,6 +403,33 @@ impl Memory {
         Ok(v)
     }
 
+    fn open_proposals(&self) -> Result<Vec<ProposalRow>> {
+        use crate::proposal::ChangeStatus;
+        Ok(self
+            .proposals()?
+            .into_iter()
+            .filter(|p| p.is_open())
+            .map(|p| ProposalRow {
+                pending: p.count(ChangeStatus::Pending),
+                held: p.count(ChangeStatus::Held),
+                changes: p
+                    .changes
+                    .iter()
+                    .map(|c| ProposalChangeRow {
+                        n: c.n,
+                        op: c.op.as_str().to_string(),
+                        target: c.target().to_string(),
+                        status: c.status.as_str().to_string(),
+                    })
+                    .collect(),
+                id: p.id,
+                shard: p.shard,
+                human: p.human,
+                created: p.created,
+            })
+            .collect())
+    }
+
     /// Build the board as of `now`. Takes no main or shard lock.
     pub fn board(&self, now: DateTime<Utc>) -> Result<Board> {
         let main = self.main()?;
@@ -404,6 +458,7 @@ impl Memory {
                 stale_secs: cfg.awareness.stale_secs,
             },
             conflicts: main.open_conflicts()?,
+            proposals: main.open_proposals()?,
             shards,
             overlaps,
             soul_proposals,

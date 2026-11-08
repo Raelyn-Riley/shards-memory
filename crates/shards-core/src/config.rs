@@ -51,6 +51,7 @@
 //! stale_with_work = true
 //! open_conflict = true
 //! soul_proposal = true
+//! proposal = true        # a shard's fact/people proposal waits for the core
 //!
 //! [wake]
 //! mode = "auto"          # "auto" | "command" | "pane"
@@ -240,6 +241,8 @@ pub struct TriggersConfig {
     pub stale_with_work: bool,
     pub open_conflict: bool,
     pub soul_proposal: bool,
+    /// A shard's fact/people proposal has changes waiting for the core.
+    pub proposal: bool,
 }
 
 impl Default for TriggersConfig {
@@ -250,6 +253,7 @@ impl Default for TriggersConfig {
             stale_with_work: true,
             open_conflict: true,
             soul_proposal: true,
+            proposal: true,
         }
     }
 }
@@ -534,6 +538,7 @@ same_section = false    # two open shards are in flight in the same section
 stale_with_work = true  # stale shard with facts in flight
 open_conflict = true    # a conflict record waits on main
 soul_proposal = true    # a soul proposal waits for an admin
+proposal = true         # a shard's fact/people proposal waits for the core
 
 [wake]
 mode = "auto"          # "auto": "pane" once `mem core start` has run, else "command" | "command" | "pane"
