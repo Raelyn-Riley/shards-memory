@@ -332,17 +332,22 @@ fn a_write_from_the_pane_stays_on_its_branch_until_dinit() {
     assert!(ctx.contains("\"shards\""), "{ctx}");
     assert!(ok(&w.pane(&b, &["core", "status"])).contains("core"));
 
-    // Dinit, from s2's pane: s1's work lands on main.
+    // Dinit, from s2's pane: s1's note lands on main, its facts wait for
+    // the core in a proposal.
     let out = ok(&w.pane(&b, &["dinit", "--id", "s1"]));
+    assert!(out.contains("merged    notes/visit.md"), "{out}");
     assert!(
-        out.contains("merged    facts/birds/heron/perch.md"),
+        out.contains("PROPOSED  facts/birds/heron/perch.md  (p1"),
         "{out}"
     );
     assert!(out.contains("shard s1 closed"), "{out}");
     assert_ne!(w.main_head(), main0);
+    fails(&w.mem(&["get", "birds/heron/perch"]));
+    ok(&w.mem(&["proposal", "accept", "p1", "--why", "both look right"]));
     assert!(ok(&w.mem(&["get", "birds/heron/perch"])).starts_with("north post\n"));
     let h = ok(&w.mem(&["history", "birds/heron/perch"]));
     assert!(h.contains("author: s1") && h.contains("human:  Ada"), "{h}");
+    assert!(h.contains("review: core accepted it from p1#"), "{h}");
     // s2 branched before the dinit: still its own view until it dinits.
     fails(&w.pane(&b, &["get", "birds/heron/perch"]));
 }
@@ -377,9 +382,10 @@ fn the_same_fact_changed_in_two_panes_is_a_recorded_conflict() {
 
     let out = ok(&w.mem(&["dinit", "--id", "s1"]));
     assert!(
-        out.contains("merged    facts/devices/kiln-east/ip.md"),
+        out.contains("PROPOSED  facts/devices/kiln-east/ip.md"),
         "{out}"
     );
+    ok(&w.mem(&["proposal", "accept", "p1", "--why", "A's switch is live"]));
     assert_ne!(w.main_head(), main0);
     let out = ok(&w.pane(&b, &["dinit", "--id", "s2"]));
     assert!(out.contains("CONFLICT  devices/kiln-east/ip"), "{out}");
@@ -448,6 +454,9 @@ fn a_shard_dinits_itself_from_inside_its_pane() {
         std::thread::sleep(Duration::from_millis(100));
     }
     assert_ne!(w.main_head(), main0);
+    // The fact waits for the core; accepted, it is on main.
+    fails(&w.mem(&["get", "birds/heron/perch"]));
+    ok(&w.mem(&["proposal", "accept", "p1", "--why", "seen there too"]));
     assert!(ok(&w.mem(&["get", "birds/heron/perch"])).starts_with("north post\n"));
     assert!(!w.m.join(".shards/worktrees/s1").exists());
     assert!(

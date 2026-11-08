@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use shards_core::{Address, Context, Error, Memory, Provenance, Take};
+use shards_core::{Address, Context, DinitReport, Error, Memory, Provenance, Take, Verdict};
 use tempfile::TempDir;
 
 fn env() -> Vec<(String, String)> {
@@ -49,6 +49,14 @@ fn open_shard(mem: &Memory, id: &str, human: &str) -> Memory {
     let s = Memory::open_with_env(&meta.worktree, env()).unwrap();
     assert_eq!(s.context(), &Context::Shard(id.to_string()));
     s
+}
+
+/// The core accepts every open change in the dinit's proposal (since brief
+/// 12, a dinit proposes facts and people instead of merging them).
+fn accept(mem: &Memory, r: &DinitReport) {
+    let id = r.proposal.as_deref().expect("the dinit made a proposal");
+    mem.proposal_decide(id, None, &Verdict::Accept(None), &core("reviewed"))
+        .unwrap();
 }
 
 fn val(mem: &Memory, a: &str) -> String {
@@ -118,16 +126,19 @@ fn two_shards_different_facts_both_dinit_cleanly() {
 
     let r1 = mem.dinit("s1", false).unwrap();
     assert!(r1.conflicts.is_empty() && r1.closed, "{r1:?}");
-    assert_eq!(r1.merged, vec!["facts/devices/ctl/ip.md"]);
+    assert_eq!(r1.proposed, vec!["facts/devices/ctl/ip.md"]);
     let r2 = mem.dinit("s2", false).unwrap();
     assert!(r2.conflicts.is_empty() && r2.closed, "{r2:?}");
+    accept(&mem, &r1);
+    accept(&mem, &r2);
 
     assert_eq!(val(&mem, "devices/ctl/ip"), "10.0.0.4");
     assert_eq!(val(&mem, "network/dns"), "10.0.0.54");
     assert_eq!(val(&mem, "network/ntp"), "10.0.0.123");
     assert_eq!(val(&mem, "devices/ctl/port"), "8080");
 
-    // Every version, with author/time/why, survives on main.
+    // The accepted version keeps the shard's author and why; the shard's
+    // intermediate value was never proposed, so it isn't main's history.
     let h = mem.history(&addr("devices/ctl/ip")).unwrap();
     let got: Vec<(&str, &str, &str)> = h
         .iter()
@@ -137,7 +148,6 @@ fn two_shards_different_facts_both_dinit_cleanly() {
         got,
         vec![
             ("10.0.0.4", "s1", "s1 moved it again"),
-            ("10.0.0.2", "s1", "s1 moved it"),
             ("10.0.0.1", "core", "seed"),
         ]
     );
@@ -162,7 +172,8 @@ fn keep_branches_false_deletes_the_branch_after_a_clean_dinit() {
     let r = mem.dinit("s1", false).unwrap();
     assert!(r.closed && r.branch_deleted, "{r:?}");
     assert!(!git(mem.root(), &["rev-parse", "--verify", "shard/s1"]).0);
-    // The shard's commit is still in main's history.
+    // The proposal holds what it needs: accepting works after the branch went.
+    accept(&mem, &r);
     assert_eq!(
         mem.history(&addr("devices/ctl/ip")).unwrap()[0].author,
         "s1"
@@ -181,7 +192,9 @@ fn same_fact_on_two_shards_conflicts_and_is_settled_by_a_human() {
     s2.supersede(&addr("devices/ctl/port"), "9090", &shardp("s2 port"))
         .unwrap();
 
-    assert!(mem.dinit("s1", false).unwrap().closed);
+    let r1 = mem.dinit("s1", false).unwrap();
+    assert!(r1.closed);
+    accept(&mem, &r1);
     let main_before = mem.head().unwrap().unwrap();
 
     // --all-or-nothing: nothing at all is written.
@@ -192,7 +205,8 @@ fn same_fact_on_two_shards_conflicts_and_is_settled_by_a_human() {
 
     let r = mem.dinit("s2", false).unwrap();
     assert!(!r.closed);
-    assert_eq!(r.merged, vec!["facts/devices/ctl/port.md"]);
+    assert!(r.merged.is_empty());
+    assert_eq!(r.proposed, vec!["facts/devices/ctl/port.md"]);
     assert_eq!(r.conflicts.len(), 1);
     let c = &r.conflicts[0];
     assert_eq!(c.target, "devices/ctl/ip");
@@ -208,20 +222,19 @@ fn same_fact_on_two_shards_conflicts_and_is_settled_by_a_human() {
     assert_eq!(c.shard.human.as_deref(), Some("Basil"));
     assert!(!c.main.updated.is_empty() && !c.shard.updated.is_empty());
 
-    // Main unchanged for that fact; non-conflicting fact merged.
+    // Main unchanged for that fact; the other fact waits in the proposal.
     assert_eq!(val(&mem, "devices/ctl/ip"), "10.0.0.2");
-    assert_eq!(val(&mem, "devices/ctl/port"), "9090");
-    // The merge commit changed exactly the merged fact + the record.
+    assert_eq!(val(&mem, "devices/ctl/port"), "8080");
+    // The merge commit changed exactly the proposal + the record.
     let commit = r.commit.clone().unwrap();
     let mut changed = mem.changed_paths(&commit).unwrap();
     changed.sort();
     assert_eq!(
         changed,
-        vec![
-            "conflicts/s2/devices/ctl/ip.md",
-            "facts/devices/ctl/port.md"
-        ]
+        vec!["conflicts/s2/devices/ctl/ip.md", "proposals/p2.json"]
     );
+    accept(&mem, &r);
+    assert_eq!(val(&mem, "devices/ctl/port"), "9090");
     let record =
         std::fs::read_to_string(mem.root().join("conflicts/s2/devices/ctl/ip.md")).unwrap();
     for needle in ["10.0.0.2", "10.0.0.3", "s1 says .2", "s2 says .3", "Basil"] {
@@ -284,9 +297,15 @@ fn resolve_conflict_take_main_and_take_value() {
         .unwrap();
     c.supersede(&addr("devices/ctl/ip"), "10.0.0.4", &shardp("c"))
         .unwrap();
-    mem.dinit("a", false).unwrap();
-    mem.dinit("b", false).unwrap();
-    mem.dinit("c", false).unwrap();
+    // Nothing conflicts at dinit (main hasn't moved); the accepts do.
+    let rs: Vec<DinitReport> = ["a", "b", "c"]
+        .iter()
+        .map(|id| mem.dinit(id, false).unwrap())
+        .collect();
+    for r in &rs {
+        assert!(r.conflicts.is_empty());
+        accept(&mem, r);
+    }
     // Two shards conflict on the same fact: must say which.
     assert!(matches!(
         mem.resolve_conflict("devices/ctl/ip", &Take::Main, None, &core("x")),
@@ -316,9 +335,11 @@ fn people_profiles_merge_like_facts() {
         .unwrap();
     s2.put_file("people/basil.md", "works nights\n", &shardp("learned"))
         .unwrap();
-    assert!(mem.dinit("s1", false).unwrap().closed);
+    let r1 = mem.dinit("s1", false).unwrap();
+    assert!(r1.closed);
+    accept(&mem, &r1);
     let r = mem.dinit("s2", false).unwrap();
-    assert_eq!(r.merged, vec!["people/basil.md"]);
+    assert_eq!(r.proposed, vec!["people/basil.md"]);
     assert_eq!(r.conflicts.len(), 1);
     assert_eq!(r.conflicts[0].record, "conflicts/s2/@/people/ada.md");
     mem.resolve_conflict("people/ada.md", &Take::Shard, None, &core("asked her"))
@@ -338,7 +359,7 @@ fn soul_change_is_a_proposal_until_an_admin_approves() {
 
     let r = mem.dinit("s1", false).unwrap();
     assert_eq!(r.proposals, vec!["soul/voice.md"]);
-    assert_eq!(r.merged, vec!["facts/devices/ctl/port.md"]);
+    assert_eq!(r.proposed, vec!["facts/devices/ctl/port.md"]);
     assert!(!r.closed);
     assert!(!mem.root().join("soul/voice.md").exists());
     assert_eq!(

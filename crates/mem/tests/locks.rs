@@ -143,6 +143,8 @@ fn three_writers_wait_mode_are_serialized_and_nothing_is_lost() {
 
     assert_eq!(get(&m, "network/ntp"), "10.0.0.123");
     assert_eq!(get(&m, "devices/ctl/port"), "9090");
+    // The dinit proposed the shard's fact; it reaches main once accepted.
+    ok(&run(&m, &["proposal", "accept", "p1", "--why", "reviewed"]));
     assert_eq!(get(&m, "devices/ctl/ip"), "10.0.0.2");
     let after = ok(&run(&m, &["history", "devices/ctl/port"]));
     assert!(after.contains("writer B") && after.contains(before.lines().nth(2).unwrap()));
