@@ -21,7 +21,8 @@
 //!
 //! | path | rule |
 //! | --- | --- |
-//! | `facts/`, `people/`, `notes/` | same as main → nothing to do; changed on main too → conflict; else applied |
+//! | `notes/` | same as main → nothing to do; changed on main too → conflict; else applied |
+//! | `facts/`, `people/` | same as main → nothing to do; changed on main too → conflict; else **proposed**: one record, `proposals/p<n>.json`, for the core to review (see [`crate::proposal`]) |
 //! | `soul/` | never applied; a proposal for a human admin (`mem soul approve`) |
 //! | anything else (`shards.toml`, `conflicts/`, README) | skipped and reported |
 //!
@@ -100,8 +101,12 @@ pub struct Conflict {
 #[derive(Debug, Clone, Default)]
 pub struct DinitReport {
     pub shard: String,
-    /// Paths applied to main.
+    /// Paths applied to main (notes).
     pub merged: Vec<String>,
+    /// The proposal holding the shard's fact and people changes, if any.
+    pub proposal: Option<String>,
+    /// The paths in that proposal.
+    pub proposed: Vec<String>,
     /// Paths changed on the shard that already match main.
     pub unchanged: Vec<String>,
     pub conflicts: Vec<Conflict>,
@@ -156,13 +161,13 @@ fn valid_id(id: &str) -> bool {
 }
 
 /// `facts/a/b.md` → `a/b`; other paths are their own target.
-fn target_of(path: &str) -> String {
+pub(crate) fn target_of(path: &str) -> String {
     Address::from_home(path)
         .map(|a| a.to_string())
         .unwrap_or_else(|| path.to_string())
 }
 
-fn record_path(shard: &str, path: &str) -> String {
+pub(crate) fn record_path(shard: &str, path: &str) -> String {
     match Address::from_home(path) {
         Some(a) => format!("conflicts/{shard}/{a}.md"),
         None => format!("conflicts/{shard}/@/{path}"),
@@ -325,7 +330,7 @@ impl Memory {
         Ok(st)
     }
 
-    fn blob(&self, rev: &str, path: &str) -> Result<Option<(String, String)>> {
+    pub(crate) fn blob(&self, rev: &str, path: &str) -> Result<Option<(String, String)>> {
         let out = self.git.run(&["ls-tree", rev, "--", path])?;
         // "<mode> blob <sha>\t<path>"
         Ok(out.lines().next().and_then(|l| {
@@ -338,7 +343,7 @@ impl Memory {
         }))
     }
 
-    fn diff_names(&self, a: &str, b: &str) -> Result<Vec<String>> {
+    pub(crate) fn diff_names(&self, a: &str, b: &str) -> Result<Vec<String>> {
         let out = self
             .git
             .run(&["diff-tree", "-r", "--no-commit-id", "--name-only", a, b])?;
@@ -346,7 +351,7 @@ impl Memory {
     }
 
     /// One side of a conflict: from front matter for facts, else from git log.
-    fn side(&self, rev: &str, path: &str) -> Result<Side> {
+    pub(crate) fn side(&self, rev: &str, path: &str) -> Result<Side> {
         let text = self.read_file_at(rev, path)?;
         if let (Some(t), Some(_)) = (&text, Address::from_home(path)) {
             if let Ok(f) = FactFile::parse(t, path) {
@@ -379,7 +384,7 @@ impl Memory {
         })
     }
 
-    fn render_record(
+    pub(crate) fn render_record(
         &self,
         shard: &str,
         c: &Conflict,
@@ -464,6 +469,7 @@ impl Memory {
             .cloned()
             .collect();
         lock_paths.push(format!("conflicts/{id}/x"));
+        lock_paths.push(crate::proposal::path_of("p0"));
         let guards = main.lock_main(&lock_paths, id, human)?;
         let _git = main.git_mutex()?;
 
@@ -478,6 +484,7 @@ impl Memory {
         let shard_changed = main.diff_names(&base, &tip)?;
 
         let mut apply: Vec<String> = Vec::new();
+        let mut propose: Vec<String> = Vec::new();
         let mut proposals: BTreeSet<String> = meta.soul_pending.iter().cloned().collect();
         for p in &shard_changed {
             let top = p.split('/').next().unwrap_or("");
@@ -497,8 +504,12 @@ impl Memory {
                             main: main.side(&main_head, p)?,
                             shard: main.side(&tip, p)?,
                         });
-                    } else {
+                    } else if top == "notes" {
+                        // Notes are never facts: merged with no review.
                         apply.push(p.clone());
+                    } else {
+                        // The core decides facts and people.
+                        propose.push(p.clone());
                     }
                 }
                 _ => report.skipped.push(p.clone()),
@@ -517,6 +528,11 @@ impl Memory {
             report.aborted = true;
             return Ok(report);
         }
+        let proposal = if propose.is_empty() {
+            None
+        } else {
+            Some(main.build_proposal(id, human, &main_head, &tip, &propose)?)
+        };
 
         let tip_merged = main
             .git
@@ -554,6 +570,22 @@ impl Memory {
                         }
                     }
                 }
+                if let Some(prop) = &proposal {
+                    let text = Memory::proposal_text(prop);
+                    let sha = main.git.exec(
+                        &["hash-object", "-w", "--stdin"],
+                        Opts {
+                            stdin: Some(text.as_bytes()),
+                            ..Default::default()
+                        },
+                    )?;
+                    idx(&[
+                        "update-index",
+                        "--add",
+                        "--cacheinfo",
+                        &format!("100644,{},{}", sha.trim(), prop.path()),
+                    ])?;
+                }
                 for c in &report.conflicts {
                     let text = main.render_record(id, c, &main_head, &tip);
                     let sha = main.git.exec(
@@ -576,8 +608,9 @@ impl Memory {
             let tree = result?;
 
             let mut summary = format!(
-                "merged {}, conflicts {}, soul proposals {}, unchanged {}, skipped {}\n",
+                "merged {}, proposed {}, conflicts {}, soul proposals {}, unchanged {}, skipped {}\n",
                 apply.len(),
+                propose.len(),
                 report.conflicts.len(),
                 pending.len(),
                 report.unchanged.len(),
@@ -586,6 +619,10 @@ impl Memory {
             summary.push('\n');
             let mut trailers: Vec<(&str, String)> = vec![("Shard", id.to_string())];
             trailers.extend(apply.iter().map(|p| ("Merged", p.clone())));
+            if let Some(prop) = &proposal {
+                trailers.push(("Proposal-Id", prop.id.clone()));
+            }
+            trailers.extend(propose.iter().map(|p| ("Proposed", p.clone())));
             trailers.extend(
                 report
                     .conflicts
@@ -630,6 +667,10 @@ impl Memory {
             report.commit = Some(commit);
         }
         report.merged = apply;
+        if let Some(prop) = proposal {
+            report.proposal = Some(prop.id);
+            report.proposed = propose;
+        }
 
         let mut meta = meta;
         meta.soul_pending = pending;

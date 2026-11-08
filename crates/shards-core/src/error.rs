@@ -61,6 +61,12 @@ pub enum Error {
     #[error("shard `{0}` has no pending soul proposal")]
     NothingToApprove(String),
 
+    #[error("no proposal `{0}` (ids look like p3; see `mem proposal list --all`)")]
+    UnknownProposal(String),
+
+    #[error("proposal: {0}")]
+    Proposal(String),
+
     #[error("no open conflict for `{0}`")]
     NoConflict(String),
 
