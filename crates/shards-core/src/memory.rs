@@ -203,6 +203,7 @@ This is a shards memory: a git repository of fact files, written only by the
   says what the core is.
 - `people/` — one profile per person.
 - `conflicts/` — open conflicts from dinits, waiting for a human.
+- `proposals/` — shards' fact and people changes, and every decision on them.
 - `shards.toml` — lock, soul-admin, shard, awareness and core settings.
 
 Read with `mem get <address>`; change with `mem set` / `mem supersede`.
@@ -225,6 +226,12 @@ What you do:
 - **Reason.** Decide what matters: two people changing the same fact, a
   shard gone quiet with work in flight, a conflict or proposal waiting for a
   human.
+- **Review proposals.** A shard's fact and people changes don't reach main
+  at dinit; they wait in a proposal for you. `mem proposal show <id>`
+  lists each change with its value and the shard's reason. Decide each one
+  with `mem proposal accept|reject|hold <id> --change N --why \"...\"`.
+  To fix a value, accept it with `--value <fixed>`. Hold a change that
+  needs a person. Every change is reviewed; nothing is accepted for you.
 - **Tell people.** Say who should talk to whom, and why, in a sentence.
 - **Write decisions to main.** What you decide and learn goes into the
   memory with `mem set`, `mem supersede` or `mem put`, with a clear `--why`.
