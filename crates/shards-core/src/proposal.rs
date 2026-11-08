@@ -241,9 +241,14 @@ fn num(id: &str) -> u64 {
 impl Memory {
     /// Proposal ids on `rev`, by number.
     fn proposal_ids(&self, rev: &str) -> Result<Vec<String>> {
-        let out = self
-            .git
-            .run(&["ls-tree", "-r", "--name-only", rev, "--", &format!("{DIR}/")])?;
+        let out = self.git.run(&[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            rev,
+            "--",
+            &format!("{DIR}/"),
+        ])?;
         let mut ids: Vec<String> = out
             .lines()
             .filter_map(|l| l.strip_prefix(&format!("{DIR}/"))?.strip_suffix(".json"))
@@ -561,7 +566,12 @@ impl Memory {
                     }
                 }
             }
-            outcome.push((n, c.target().to_string(), c.status, c.conflict_record.clone()));
+            outcome.push((
+                n,
+                c.target().to_string(),
+                c.status,
+                c.conflict_record.clone(),
+            ));
             p.log.push(d);
         }
         writes.push((p.path(), Some(p.render())));

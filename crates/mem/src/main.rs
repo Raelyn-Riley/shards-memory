@@ -14,8 +14,8 @@ use shards_core::coresession::Landed;
 use shards_core::shardsession::ShardLaunch;
 use shards_core::{
     resolve, sample, Address, CoreStatus, DinitReport, Memory, NewQuirk, Owner, PassReport,
-    Proposal, Provenance, Quirk, QuirkState, Rank, ResolveOptions, ShardMeta, ShardStart, Side, StartReport,
-    Take, UsageEntry, Verdict, WakeOutcome,
+    Proposal, Provenance, Quirk, QuirkState, Rank, ResolveOptions, ShardMeta, ShardStart, Side,
+    StartReport, Take, UsageEntry, Verdict, WakeOutcome,
 };
 
 #[derive(Parser)]
@@ -666,7 +666,10 @@ fn print_proposal(out: &mut impl Write, p: &Proposal) -> io::Result<()> {
                 d.change,
                 d.action,
                 d.by,
-                d.human.as_deref().map(|h| format!(" / {h}")).unwrap_or_default(),
+                d.human
+                    .as_deref()
+                    .map(|h| format!(" / {h}"))
+                    .unwrap_or_default(),
                 d.why,
                 d.value
                     .as_deref()
@@ -984,7 +987,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 writeln!(out, "  human:  {}", e.human.as_deref().unwrap_or("-"))?;
                 writeln!(out, "  why:    {}", e.why)?;
                 if let Some(r) = &e.review {
-                    writeln!(out, "  review: {} accepted it from {}: {}", r.by, r.proposal, r.why)?;
+                    writeln!(
+                        out,
+                        "  review: {} accepted it from {}: {}",
+                        r.by, r.proposal, r.why
+                    )?;
                 }
                 writeln!(out, "  value:  {}", e.value.replace('\n', "\n          "))?;
             }
