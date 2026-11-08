@@ -9,7 +9,7 @@ A shards system is one agent with one shared memory, met through many sessions. 
 - **A shard is a session in a pane.** A shard is a whole agent session in its own tmux pane, the same shape as the core, not a sub-agent. A person talks to the same shard for the whole session, so nothing they build together is lost mid-work. Its pane stays up until the person says they're done; nothing closes it for being idle or stale.
 - **One soul, not one per person.** There is never "Alice's agent" or "Bob's agent." Every shard is born from the same soul files in main.
 - **Code-switching, not separate selves.** Main keeps one profile per person (tastes, how they like answers, what they're working on). A shard reads the soul, then the profile of whoever it's talking to.
-- **Dinit merges back.** When the person is done, the shard dinits: it hands its branch to the core, which merges it into main and checks nothing conflicts.
+- **Dinit hands back a proposal.** The core decides facts and people. When the person is done, the shard dinits: its notes merge into main, and its fact and people changes become one proposal. The core reviews each change, accepting, fixing, rejecting or holding it for a human, and only accepted changes reach main.
 
 ```mermaid
 flowchart TB
@@ -61,7 +61,10 @@ Shards never block each other while they work, because each one is on its own br
 
 **Conflict rules**
 
-- **Different facts changed:** merged automatically. Expected for almost every dinit.
+- **Notes:** merged at dinit with no review. Notes are never facts.
+- **Facts and people:** never merged at dinit. Each change goes into one proposal record on main, with its value and the shard's reason, and waits for the core. Every change needs a reason when the shard makes it. Every change is reviewed: there is no auto-accept and no small-change path.
+- **Accepting:** the change goes to main under the lock, stamped with the shard, its human, the shard's reason and the core's reason. Every decision is logged with its reason in the record, and nothing is deleted.
+- **Main moved before the accept:** if main changed the same fact since the proposal was made, accepting records a conflict, the same as at dinit.
 - **The same fact changed by two shards since they branched:** a real conflict. The core keeps both in history and asks the humans (or the latest author) which value is current. It never guesses.
 - **A raw value written where a pointer belongs:** flagged at dinit, before the merge.
 - **Soul and person profiles:** stricter than facts. Profile updates merge normally; a change to the soul itself is proposed and goes through the core or a human, so one session can't quietly reshape who the agent is.
@@ -105,8 +108,8 @@ Transcripts are read incrementally. Only the time and a short summary of each to
   - *same fact*: two shards have the same fact in flight, a conflict caught before dinit;
   - *same section*: two shards are working in the same top-level section.
 
-  The board also lists open conflicts and pending soul proposals. Reading it takes no lock and never blocks a writer.
-- **`mem watch`** runs the board on a timer and checks configured **triggers**: same fact, same section, a stale shard with work in flight, an open conflict, a soul proposal. Each trigger can be switched on or off in `shards.toml`. A condition fires once while it holds and can fire again after it clears and comes back. Each firing is appended to an event log.
+  The board also lists open conflicts, pending soul proposals and fact/people proposals still to decide. Reading it takes no lock and never blocks a writer.
+- **`mem watch`** runs the board on a timer and checks configured **triggers**: same fact, same section, a stale shard with work in flight, an open conflict, a soul proposal, a new fact/people proposal. Each trigger can be switched on or off in `shards.toml`. A condition fires once while it holds and can fire again after it clears and comes back. Each firing is appended to an event log.
 
 **3. Reasoning core.** This is not a one-shot call. It is one long-lived chat session in a tmux pane, so it remembers what it has reasoned about from one wake to the next.
 
@@ -130,5 +133,6 @@ Delivery to shards is not built yet.
 
 - Written in Rust; AGPL-3.0.
 - Person profiles live in main.
+- The core decides facts and people. A shard's fact and people changes are a proposal the core reviews change by change; notes merge at dinit.
 - The soul changes very rarely: a soul change requires a human admin.
 - Timestamps are stored in UTC (RFC 3339); interfaces show local time.
