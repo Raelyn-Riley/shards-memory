@@ -70,7 +70,8 @@ Global: `-C, --memory <dir>` (or `SHARDS_MEMORY`) picks the memory and defaults 
 | `mem get <address>` prints the value, then `home: <path>`. An unknown address exits 1. | `mem get devices/rotoforge-ctl/ip` |
 | `mem set <address> <value> --why ...` creates a **new** fact. Every fact and people write needs a `--why`; without one it is refused with a message telling the agent to say why. It refuses only an exact existing address (use `supersede`). Near-duplicates such as the same name elsewhere are left to the later drift checker, which flags them for a human. | `mem set devices/rotoforge-ctl/ip 10.0.4.40 --why "first seen on the bench"` |
 | `mem supersede <address> <value> --why ...` replaces an existing fact's value as one commit that touches only that file. | `mem supersede devices/rotoforge-ctl/ip 10.0.4.41 --why "moved to the new switch"` |
-| `mem history <address>` shows every version, newest first: time, commit, author, human, why and value. | `mem history devices/rotoforge-ctl/ip` |
+| `mem set\|supersede\|put ... --answers <question>` (from a shard) records the person's answer to an open question. It must be about the question's fact or path, and the question must be open. At dinit it is a proposal like any other. See [Open questions](#open-questions). | `mem supersede lathe/two/spindle "replaced 2026-11-03" --why "Cleo helped fit it" --answers ask1` |
+| `mem history <address>` shows every version, newest first: time, commit, author, human, why and value. Under a version accepted from a proposal it lists the shard's **drafts**: its in-between values and reasons before the dinit, marked as never on main. Drafts of proposals not accepted come last, with their status. | `mem history devices/rotoforge-ctl/ip` |
 | `mem resolve [file\|-] [--annotate]` replaces every `{{fact:...}}` with the current value. `--annotate` gives `10.0.4.41 [devices/rotoforge-ctl/ip]`. Any unresolvable pointer is an error that names it. | `mem resolve notes/runbook.md --annotate` |
 | `mem gen-sample <dir> --seed N` builds a fake flock: 3 birds, 30 facts in 4 sections, 3 supersedes, 3 notes with pointers. The same seed gives byte-identical commits. | `mem gen-sample /tmp/flock --seed 7` |
 | `mem put <path> [file\|-] --why ...` writes a `notes/`, `people/` or `soul/` markdown file as one commit. Writing `soul/` on main needs an admin `--human`. | `mem put people/ada.md profile.md --why "prefers short answers"` |
@@ -89,10 +90,15 @@ Global: `-C, --memory <dir>` (or `SHARDS_MEMORY`) picks the memory and defaults 
 | `mem proposal show <id> [--json]` shows each change (op, target, proposed value, main's value, the shard's reason, status) and every decision. | `mem proposal show p3` |
 | `mem proposal accept <id> [--change N] [--value V] --why ...` writes the change(s) to main. `--value` accepts a fixed value instead; the record keeps both. | `mem proposal accept p3 --change 2 --value 10.0.4.42 --why "the switch says .42"` |
 | `mem proposal reject <id> [--change N] --why ...` leaves main as it is. | `mem proposal reject p3 --change 1 --why "the vent stays shut"` |
-| `mem proposal hold <id> [--change N] --why ...` leaves main as it is and waits for a human; deciding a held change needs `--human`. | `mem proposal hold p3 --change 3 --why "ask Ada"` |
-| `mem resolve-conflict <address\|path.md> --take shard\|main\|<value> --why ... [--shard <id>]` settles a recorded conflict on main. | `mem resolve-conflict devices/ctl/ip --take shard --why "s7's switch is live"` |
+| `mem proposal hold <id> [--change N] --why ... --ask "<question>"` leaves main as it is and waits for a human; deciding a held change needs `--human`. The ask is required: it becomes an open question for the next person who can answer. | `mem proposal hold p3 --change 3 --why "only said in passing" --ask "Mike mentioned he replaced the spindle. Would you confirm it?"` |
+| `mem question list [--all] [--json]` / `mem question show <id> [--json]` lists open questions, or shows one: the ask, the held change, who said it and why, answers waiting for the core, and everything since. | `mem question show ask1` |
+| `mem question dont-know <id> --why ...` (from a shard) records that the person asked doesn't know. The question stays open for the next person. | `mem question dont-know ask1 --why "Basil was off that week"` |
+| `mem shard context [--id <id>]` is what a shard should know at the start of a session: who it is with, and the open questions this person may answer. In a pane the id defaults to the pane's shard. | `mem shard context` |
+| `mem resolve-conflict <address\|path.md> --take shard\|main\|<value> --why ... [--shard <id>]` settles a recorded conflict on main. A person's pick is final: no proposal review. Needs the settler's name (`--human`, or the shard's human from a pane) and `--why`, and writes an incident. | `mem resolve-conflict devices/ctl/ip --take shard --human Cleo --why "s7's switch is live"` |
+| `mem incident list [--json]` / `mem incident show <id> [--json]` lists incidents, newest first, or shows one: both sides, who settled it, their reason, and notes. | `mem incident show i2` |
+| `mem incident note <id> <text\|-> --why ...` adds a note to an incident (the core's, usually; not from a shard). Notes are appended; nothing is removed. | `mem incident note i2 "the probe reads 20 low" --why "second conflict this month"` |
 | `mem soul approve <shard-id> --human <admin>` writes a shard's pending soul proposal to main. Admins only. | `mem soul approve s7 --human Ada` |
-| `mem board [--json]` shows every open shard (human, state, pane, gist, last activity, facts in flight, last few actions), then overlaps, open conflicts and soul proposals. Takes no lock. | `mem board --json` |
+| `mem board [--json]` shows every open shard (human, state, pane, gist, last activity, facts in flight, last few actions), then overlaps, open conflicts, soul proposals, proposals, open questions and recent incidents. Takes no lock. | `mem board --json` |
 | `mem watch [--once]` evaluates the triggers every `[intervals] watch_poll_secs`, records events and wakes the core. `--once` runs one pass and exits. | `mem watch --once` |
 | `mem core context` prints `mem board --json` and the pending events as one JSON document: everything a woken core needs. | `mem core context` |
 | `mem core start [--resume]` starts the core in its own tmux pane with a first message, and pins its session id. A no-op if it is running. `--resume` resumes the pinned session instead of starting a fresh one. | `mem core start` |
@@ -253,7 +259,14 @@ the dinit's own merge commit. The record lists each change:
 - the path and the fact address;
 - the proposed `value` and `main_value`, main's value when the proposal was made;
 - the shard's `why`, its `author` (the shard id) and when it made the change;
-- `status`: `pending`, `held`, `accepted`, `rejected` or `conflict`.
+- `status`: `pending`, `held`, `accepted`, `rejected`, `conflict` or `answered`;
+- `drafts`, when the shard changed the path more than once before its dinit: every
+  in-between version, oldest first, with its value, reason, time and shard commit.
+  Drafts were never on main. They are kept for debugging: why the shard thought what
+  it thought. `mem proposal show` and `mem history` list them;
+- `answers`, when the change answers an open question; `question`, on a held change,
+  the question asked about it; `answered_by`, on an answered change, the answer
+  (`p4#1`).
 
 The record also names the shard, its human, the time, main's commit at the dinit and
 the shard's tip.
@@ -274,7 +287,9 @@ the shard's tip.
   with `mem resolve-conflict`.
 - **Reject** leaves main alone.
 - **Hold** leaves main alone and waits for a human. Accepting or rejecting a held
-  change needs `--human`.
+  change needs `--human`. A hold needs `--ask`, the question to put to the next person
+  who can answer it; it writes an [open question](#open-questions) in the same commit.
+  A proposal whose changes are all held doesn't wake the core.
 
 A decision is final, and every decision needs a `--why`. Each one is a commit on main
 that rewrites the record with the new status and appends to its `log`: the time, the
@@ -296,10 +311,47 @@ The core ran `mem core context` and `mem proposal show p1`, then
 `mem proposal accept p1 --change 1 --why "..."`. The fact was then on main with both
 reasons, and the core acked the event.
 
+### Open questions
+
+When the core holds a change, something is unconfirmed that only a person could check.
+So the hold asks: `--ask "<question>"` is required, and the hold writes
+`questions/ask<n>.json` on main in the same commit. It holds the ask, the held change
+(`p3#2`), the value, who said it (the shard and its human), the shard's reason, who held
+it and why, a `log` of everything since, and `closed` once it closes.
+
+- **Asked at the start.** `mem shard context` lists the open questions the shard's
+  person may answer, with who said it and why it needs confirming. The shard init's
+  WHEN TO MENTION table says to ask one near the start of a session, after the person's
+  own business, once per question per session.
+- **Who may answer:** anyone, for now. The rule is one function, `Memory::may_answer`,
+  used for listing, `--answers` and `dont-know`, so a later rule (people in the fact's
+  history, roles, admins) goes there.
+- **They know.** The shard records it as a normal change citing the question:
+  `mem supersede <address> <value> --why "..." --answers ask1` (or `set`, or `put` for a
+  profile). The commit carries `Shards-Answers: ask1`. At dinit the change is a proposal
+  like any other, with `answers: ask1`, and wakes the core.
+- **The core accepts (or fixes) the answer:** the question closes (`closed.by_change`
+  is `p4#1`), and the held change becomes `answered` with `answered_by: p4#1` and an
+  `answered` entry in its proposal's log. Linked both ways.
+- **The core rejects or holds the answer:** logged on the question
+  (`answer-rejected`, `answer-held`), which stays open for the next person. Holding an
+  answer asks a new question of its own.
+- **They don't know.** `mem question dont-know ask1 --why "..."` writes straight to
+  main from the shard. The question stays open, and the next shard's context says who
+  didn't know.
+- **A human decides the held change directly** (`mem proposal accept p3 --change 2
+  --human Mike --why ...`): the question closes with it.
+
+Nothing in a question is removed. `mem board` and `mem core context` list open
+questions.
+
 ### Conflicts
 
-`mem resolve-conflict devices/ctl/ip --take shard|main|<value> --why "..."` settles a
-conflict on main as one commit, which also deletes the conflict record.
+`mem resolve-conflict devices/ctl/ip --take shard|main|<value> --human Cleo --why "..."`
+settles a conflict on main as one commit, which also deletes the conflict record. A
+person's pick is final: the value goes to main with no proposal review, because a
+person settling it outranks the core. The settler's name (`--human`, or the shard's
+human when run from a pane) and `--why` are required.
 
 - `main` keeps main's value.
 - `shard` writes the shard's value.
@@ -309,6 +361,26 @@ conflict on main as one commit, which also deletes the conflict record.
   `Shards-Take` and `Shards-Shard` trailers.
 - If several shards conflict on the same fact, pick one with `--shard <id>`.
 - Profiles and notes are named by path: `mem resolve-conflict people/ada.md --take shard ...`.
+
+### Incidents
+
+Every resolution writes an incident, `incidents/i<n>.json`, in the same commit:
+
+- `summary`, one line for people: "two shards conflicted over kiln/east/temp. Cleo
+  checked it. shard s2 was correct." (For `--take main` the correct shard is the
+  author of main's value; for a literal value, "neither was correct".)
+- `main` and `shard_side`: each side's value, author, human, time and reason, as the
+  conflict record had them;
+- `shards` and `humans`: everyone involved, the settler included;
+- `settled`: what was taken, the value on main afterwards, which side was correct, the
+  settler, who ran it, their reason and when;
+- the conflict record's path and when the conflict was recorded;
+- `notes`: added later with `mem incident note`, each with its author and reason.
+
+A new incident fires the `incident` trigger (on by default), so the core is woken to
+read it, and may add its own note. Nothing in an incident is ever changed or deleted;
+a note is appended, and git keeps every version. `mem board` and `mem core context`
+list the five most recent.
 
 ### Soul approval
 
@@ -453,8 +525,9 @@ overlaps:
 - **`same-section`**: two or more open shards are in flight in the same top-level
   section (a fact's first address segment, or `people` or `notes`).
 
-Open conflict records on main, pending soul proposals, and fact/people proposals with a
-change pending or held are listed under the overlaps.
+Open conflict records on main, pending soul proposals, fact/people proposals with a
+change pending or held, open questions and the five most recent incidents are listed
+under the overlaps.
 
 Reading the board never takes the main lock or a shard lock, so it never blocks a
 writer. It runs only read-only git commands, with `GIT_OPTIONAL_LOCKS=0` so that
@@ -504,6 +577,11 @@ change.
   "conflicts": [{ "shard": "s3", "target": "network/dns",
                   "record": "conflicts/s3/network/dns.md", "humans": ["Ada", "Cleo"] }],
   "soul_proposals": [{ "shard": "s4", "human": "Dov", "paths": ["soul/voice.md"] }],
+  "questions": [{ "id": "ask1", "ask": "Would you confirm it?", "target": "lathe/two/spindle",
+                  "change": "p2#1", "said_by": "Mike", "dont_know": 1 }],
+  "incidents": [{ "id": "i1", "summary": "two shards conflicted over ...", // newest first, at most 5
+                  "target": "kiln/east/temp", "settled_by": "Cleo",
+                  "settled_at": "2026-11-10T10:00:00Z", "notes": 0 }],
   "proposals": [{                              // fact/people proposals with a change pending or held
     "id": "p3", "shard": "s5", "human": "Basil",
     "created": "2026-11-04T22:40:00Z",
@@ -531,6 +609,7 @@ A pass builds the board and checks the **triggers** that are switched on:
 | `open_conflict` | a conflict record exists on main | `open-conflict:<record path>` |
 | `soul_proposal` | a shard has a pending soul proposal | `soul-proposal:<id>:<paths>` |
 | `proposal` | a fact/people proposal has a change pending (not held) | `proposal:<id>` |
+| `incident` | a person settled a conflict: a new incident (one of the five most recent) | `incident:<id>` |
 
 When a condition starts to hold, one **event** is appended to `.shards/events.jsonl`
 and added to the pending list:
@@ -874,6 +953,7 @@ stale_with_work = true  # stale shard with facts in flight
 open_conflict = true
 soul_proposal = true
 proposal = true         # a shard's fact/people proposal waits for the core
+incident = true         # a person settled a conflict; the core reads the incident
 
 [wake]
 mode = "auto"           # "auto": pane once mem core start has run, else command | "command" | "pane"
@@ -966,13 +1046,17 @@ Shards-Why: moved to the new switch
     `Shards-Proposed` (a fact/people proposal), `Shards-Conflict`, and
     `Shards-Proposal` (a soul path), one per path.
   - `resolve-conflict`: the target, plus `Shards-Target`, `Shards-Shard` and
-    `Shards-Take`.
+    `Shards-Take`. The commit also writes the incident.
+  - `incident-note`: the incident id, plus `Shards-Incident`.
+  - `question-dont-know`: the question id, plus `Shards-Question`.
+  - A fact or people write from a shard that answers a question adds
+    `Shards-Answers`.
   - `soul-approve`: the shard id, plus `Shards-Shard`, `Shards-Approved-By` and
     `Shards-From-Commit`.
   - `proposal-accept`, `proposal-reject` and `proposal-hold`: the proposal id, plus
     `Shards-Proposal`, `Shards-Shard`, `Shards-Shard-Human`, and for each change
     decided a `Shards-Change` (`<n> <target>`) and a `Shards-Shard-Why`
-    (`<n>: <reason>`).
+    (`<n>: <reason>`). A hold adds `Shards-Ask`.
 - The body is git trailers, so `git log --format='%(trailers:key=Shards-Why,valueonly)'`
   works. `Shards-Human` is omitted when there is no human.
 - The git author and committer are both the shard: name `<author>`, email
