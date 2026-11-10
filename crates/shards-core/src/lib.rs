@@ -21,6 +21,7 @@ pub mod fact;
 pub mod git;
 pub mod incident;
 pub mod index;
+pub mod init;
 pub mod lock;
 pub mod memory;
 pub mod notes;

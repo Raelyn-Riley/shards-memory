@@ -289,7 +289,8 @@ pub fn summarize_usage(entries: &[UsageEntry]) -> Vec<UsageRow> {
 pub fn first_message(root: &Path, baton: Option<&str>) -> String {
     let mut s = format!(
         "You are the shards core for the memory at {}. Read soul/core.md and the rest of \
-         soul/, then run `mem core context`. A line starting with [WAKE] means events are \
+         soul/ (your init, soul/init-core.md, you were given at the start), then run \
+         `mem core context`. A line starting with [WAKE] means events are \
          pending: run `mem core context`, reason, review proposals with `mem proposal show` \
          and `mem proposal accept|reject|hold` (a hold needs --ask, the question for the next \
          person), read new incidents with `mem incident show`, tell people, write decisions \
@@ -344,6 +345,35 @@ impl Core {
     }
     fn first_path(&self) -> PathBuf {
         self.dir.join("first-message.md")
+    }
+    fn init_path(&self) -> PathBuf {
+        self.dir.join("init.md")
+    }
+
+    /// Write the core's init (from main's soul) for this launch. `None`: the
+    /// memory has no `soul/init-core.md`.
+    fn write_init(&self) -> Result<Option<String>> {
+        let init = Memory::open(&self.root)?.core_init()?;
+        let path = self.init_path();
+        match &init {
+            Some(text) => {
+                fs::create_dir_all(&self.dir)?;
+                fs::write(&path, text)?;
+                self.log(&format!(
+                    "init: {} bytes from soul/init-core.md",
+                    text.len()
+                ));
+            }
+            None => {
+                let _ = fs::remove_file(&path);
+            }
+        }
+        Ok(init)
+    }
+
+    /// The init file to pass on the launch line, when the adapter takes it.
+    fn launch_init(&self, init: &Option<String>) -> Option<PathBuf> {
+        (init.is_some() && self.adapter.init_in_launch()).then(|| self.init_path())
     }
 
     fn log(&self, msg: &str) {
@@ -438,13 +468,21 @@ impl Core {
     fn launch_fresh(&self, baton: Option<&str>, not: Option<&str>) -> Result<Option<String>> {
         let first = self.first_path();
         fs::create_dir_all(&self.dir)?;
-        fs::write(&first, first_message(&self.root, baton))?;
+        let init = self.write_init()?;
+        let mut message = first_message(&self.root, baton);
+        if let (Some(text), false) = (&init, self.adapter.init_in_launch()) {
+            // No system prompt to put it in: the init opens the first message.
+            message = format!("{}\n\n---\n\n{message}", text.trim_end());
+        }
+        fs::write(&first, message)?;
         let started = Utc::now();
+        let init_file = self.launch_init(&init);
         let line = self.adapter.launch_line(
             &self.cfg.command,
             &Launch::Fresh {
                 first_message: &first,
             },
+            init_file.as_deref(),
         );
         self.type_line(&line)?;
         if !self.pane.wait_alive(self.cfg.start_timeout()) {
@@ -482,9 +520,15 @@ impl Core {
     }
 
     fn launch_resume(&self, id: &str) -> Result<()> {
-        let line = self
-            .adapter
-            .launch_line(&self.cfg.command, &Launch::Resume { id });
+        // A resumed session gets its init again (see the adapter): the
+        // recorded one stands until a compaction, then this one does.
+        let init = self.write_init()?;
+        let init_file = self.launch_init(&init);
+        let line = self.adapter.launch_line(
+            &self.cfg.command,
+            &Launch::Resume { id },
+            init_file.as_deref(),
+        );
         self.type_line(&line)?;
         if !self.pane.wait_alive(self.cfg.start_timeout()) {
             return Err(Error::Core(format!(

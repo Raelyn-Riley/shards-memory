@@ -206,8 +206,11 @@ This is a shards memory: a git repository of fact files, written only by the
 `mem` tool.
 
 - `facts/` — one file per fact; the path is the fact's only home.
-- `soul/` — who the agent is. Changes require a human admin. `soul/core.md`
-  says what the core is.
+- `soul/` — who the agent is. Changes require a human admin.
+  `soul/init-core.md` and `soul/init-shard.md` are the inits every core and
+  shard session starts with; fill in `<org>` and `<answers-to>`.
+  `soul/core.md` says how the core's machinery works. `soul/name.md` is
+  the name the core picks once.
 - `people/` — one profile per person.
 - `conflicts/` — open conflicts from dinits, waiting for a human.
 - `proposals/` — shards' fact and people changes, and every decision on them.
@@ -318,6 +321,14 @@ impl Memory {
             files.push((format!("{d}/.gitkeep"), ""));
         }
         files.push(("soul/core.md".to_string(), SOUL_CORE));
+        files.push((
+            crate::init::CORE_INIT.to_string(),
+            crate::init::TEMPLATE_CORE,
+        ));
+        files.push((
+            crate::init::SHARD_INIT.to_string(),
+            crate::init::TEMPLATE_SHARD,
+        ));
         let mut add = vec!["add", "--"];
         for (p, text) in &files {
             fs::write(dir.join(p), text)?;

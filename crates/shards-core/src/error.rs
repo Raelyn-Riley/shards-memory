@@ -80,6 +80,8 @@ pub enum Error {
     BadQuestion(String),
     #[error("{0}")]
     Description(String),
+    #[error("name: {0}")]
+    BadName(String),
 
     #[error("settling a conflict needs the name of the person who checked it: pass --human <name> (or set SHARDS_HUMAN)")]
     MissingSettler,

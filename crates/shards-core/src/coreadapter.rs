@@ -56,8 +56,15 @@ pub fn shell_quote(s: &str) -> String {
 
 pub trait CoreAdapter {
     fn name(&self) -> &'static str;
-    /// The shell line typed into the pane to start the core.
-    fn launch_line(&self, command: &str, launch: &Launch) -> String;
+    /// The shell line typed into the pane to start the core (or a shard).
+    /// `init`, a file, is the session's init: an adapter that can, passes
+    /// it as part of the system prompt (see [`CoreAdapter::init_in_launch`]).
+    fn launch_line(&self, command: &str, launch: &Launch, init: Option<&Path>) -> String;
+    /// Whether [`CoreAdapter::launch_line`] delivers the init. If not, the
+    /// runner puts it in the first message instead.
+    fn init_in_launch(&self) -> bool {
+        false
+    }
     /// Whether [`Launch::Fresh`] already carries the first message. If not,
     /// the runner types a short pointer to the first-message file instead.
     fn first_message_in_launch(&self) -> bool;
@@ -156,24 +163,47 @@ impl CoreAdapter for ClaudeCodeCore {
         "claude-code"
     }
 
-    fn launch_line(&self, command: &str, launch: &Launch) -> String {
+    /// The init rides as `--append-system-prompt` on **every** launch:
+    /// fresh, resume, watchdog restore and handoff. Why the system prompt
+    /// and not the first message: a first message is one turn in the chat,
+    /// and a long session compacts it into a summary; the system prompt is
+    /// sent with every request, so the init holds for the whole session.
+    /// Claude Code (2.1.322) records the system prompt on a conversation's
+    /// first request and reuses that record on every later request and
+    /// resume, until the conversation is compacted; then it renders it again
+    /// from the running launch's flags. So a resume passes the init again:
+    /// it doesn't add a second copy (the record wins until a compaction),
+    /// and after a compaction the init is still there.
+    ///
+    /// Each file is read by the shell, so only a short line is typed,
+    /// however long the text is. `--` ends the options, so a variadic flag
+    /// in `command` (such as `--allowedTools a b`) can't swallow the message.
+    fn launch_line(&self, command: &str, launch: &Launch, init: Option<&Path>) -> String {
+        let init = init
+            .map(|f| {
+                format!(
+                    " --append-system-prompt \"$(cat {})\"",
+                    shell_quote(&f.to_string_lossy())
+                )
+            })
+            .unwrap_or_default();
         match launch {
-            // The message is read from the file by the shell, so only this
-            // short line is typed, however long the message is. `--` ends
-            // the options, so a variadic flag in `command` (such as
-            // `--allowedTools a b`) can't swallow the message.
             Launch::Fresh { first_message } => format!(
-                "{command} -- \"$(cat {})\"",
+                "{command}{init} -- \"$(cat {})\"",
                 shell_quote(&first_message.to_string_lossy())
             ),
             // Always the explicit id: `--continue` picks the most recently
             // touched transcript, which can be the wrong session.
-            Launch::Resume { id } => format!("{command} --resume {}", shell_quote(id)),
+            Launch::Resume { id } => format!("{command} --resume {}{init}", shell_quote(id)),
             Launch::Blank { id: Some(id) } => {
-                format!("{command} --session-id {}", shell_quote(id))
+                format!("{command} --session-id {}{init}", shell_quote(id))
             }
-            Launch::Blank { id: None } => command.to_string(),
+            Launch::Blank { id: None } => format!("{command}{init}"),
         }
+    }
+
+    fn init_in_launch(&self) -> bool {
+        true
     }
 
     fn first_message_in_launch(&self) -> bool {
@@ -260,7 +290,7 @@ impl CoreAdapter for PlainCore {
     fn name(&self) -> &'static str {
         "plain"
     }
-    fn launch_line(&self, command: &str, _: &Launch) -> String {
+    fn launch_line(&self, command: &str, _: &Launch, _: Option<&Path>) -> String {
         command.to_string()
     }
     fn first_message_in_launch(&self) -> bool {
@@ -621,7 +651,7 @@ mod tests {
             config_file: None,
         };
         assert_eq!(
-            c.launch_line("claude --model haiku", &Launch::Resume { id: "abc" }),
+            c.launch_line("claude --model haiku", &Launch::Resume { id: "abc" }, None),
             "claude --model haiku --resume 'abc'"
         );
         let l = c.launch_line(
@@ -629,12 +659,38 @@ mod tests {
             &Launch::Fresh {
                 first_message: Path::new("/m/.shards/core/first.md"),
             },
+            None,
         );
         assert_eq!(l, "claude -- \"$(cat '/m/.shards/core/first.md')\"");
         assert!(!l.contains("--continue"));
         assert_eq!(
-            c.launch_line("claude", &Launch::Blank { id: Some("u-1") }),
+            c.launch_line("claude", &Launch::Blank { id: Some("u-1") }, None),
             "claude --session-id 'u-1'"
+        );
+        // The init rides on every launch, before `--`.
+        let init = Some(Path::new("/m/.shards/core/init.md"));
+        let sp = " --append-system-prompt \"$(cat '/m/.shards/core/init.md')\"";
+        assert_eq!(
+            c.launch_line("claude", &Launch::Resume { id: "abc" }, init),
+            format!("claude --resume 'abc'{sp}")
+        );
+        assert_eq!(
+            c.launch_line(
+                "claude --allowedTools a b",
+                &Launch::Fresh {
+                    first_message: Path::new("/f.md")
+                },
+                init
+            ),
+            format!("claude --allowedTools a b{sp} -- \"$(cat '/f.md')\"")
+        );
+        assert_eq!(
+            c.launch_line("claude", &Launch::Blank { id: Some("u-1") }, init),
+            format!("claude --session-id 'u-1'{sp}")
+        );
+        assert_eq!(
+            PlainCore.launch_line("cat", &Launch::Blank { id: None }, init),
+            "cat"
         );
     }
 

@@ -253,7 +253,7 @@ enum ShardCmd {
         json: bool,
     },
     /// What a shard should know at the start of a session: who it is with,
-    /// and the open questions this person may answer.
+    /// their profile, the open questions this person may answer, open quirks.
     Context {
         /// The shard (default: this pane's shard).
         #[arg(long, env = "SHARDS_SHARD")]
@@ -403,6 +403,17 @@ enum CoreCmd {
     },
     /// Stop the core deliberately (the watchdog leaves it stopped).
     Stop,
+    /// The core picks the agent's name, once (soul/name.md). After that
+    /// only a human admin changes it.
+    Name {
+        name: String,
+        #[arg(long)]
+        why: Option<String>,
+        #[command(flatten)]
+        who: Who,
+    },
+    /// Print the core's init as its next session will get it.
+    Init,
     /// Pane, command, pinned session, last wake, watchdog and keep-warm.
     Status {
         #[arg(long)]
@@ -1492,7 +1503,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Shard(ShardCmd::Start { id, human, resume }) => {
             let mem = Memory::open(&cli.memory)?;
             let human = given(human);
-            match mem.shard_start(id.as_deref(), human.as_deref(), resume, ShardLaunch::Blank)? {
+            match mem.shard_start(id.as_deref(), human.as_deref(), resume, ShardLaunch::Init)? {
                 ShardStart::AlreadyRunning { meta } => writeln!(
                     out,
                     "shard {} is already running (session {}); nothing to do",
@@ -1820,19 +1831,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 shards_core::Context::Shard(s) => Some(s.clone()),
                 _ => None,
             });
-            let human = match &id {
-                Some(id) => mem.shard_meta(id).ok().and_then(|m| m.human),
-                None => None,
-            };
-            match &id {
-                Some(id) => writeln!(
-                    out,
-                    "You are shard {id}, with {}.\n",
-                    human.as_deref().unwrap_or("no one named yet")
-                )?,
-                None => writeln!(out, "Not in a shard.\n")?,
-            }
-            write!(out, "{}", mem.questions_brief(human.as_deref())?)?;
+            write!(out, "{}", mem.shard_context(id.as_deref())?)?;
         }
         Cmd::Board { json } => {
             let mem = Memory::open(&cli.memory)?;
@@ -1868,6 +1867,23 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     )?;
                     writeln!(out, "attach: {}", mem.core_attach_command()?.join(" "))?;
                 }
+            }
+        }
+        Cmd::Core(CoreCmd::Name { name, why, who }) => {
+            let mem = Memory::open(&cli.memory)?;
+            let commit = mem.core_name(&name, &prov(who, why))?;
+            writeln!(
+                out,
+                "named: {} ({}); it's in soul/name.md, and every init now uses it",
+                name.trim(),
+                short(&commit)
+            )?;
+        }
+        Cmd::Core(CoreCmd::Init) => {
+            let mem = Memory::open(&cli.memory)?;
+            match mem.core_init()? {
+                Some(t) => write!(out, "{t}")?,
+                None => writeln!(out, "this memory has no soul/init-core.md")?,
             }
         }
         Cmd::Core(CoreCmd::Stop) => {

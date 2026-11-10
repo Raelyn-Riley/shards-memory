@@ -20,9 +20,14 @@
 //! `--continue`). Nothing stops a pane for being idle or stale; it stays up
 //! until someone stops it or a clean dinit closes the shard.
 //!
-//! For now a shard starts **blank**: no soul, no profile, no first message.
-//! [`Memory::shard_start`] has one place, [`ShardLaunch`], where an init
-//! will plug in later.
+//! **Its init.** With [`ShardLaunch::Init`] (what `mem shard start` uses) a
+//! shard starts with its init as its first context: main's
+//! `soul/init-shard.md`, then its `mem shard context` (who it is with, the
+//! open questions they may answer, open quirks). With Claude Code it rides
+//! as an appended system prompt on every launch, a resume included (see
+//! `coreadapter.rs`); the person still speaks first. An adapter without a
+//! system prompt gets a short `[INIT] read <file>` line instead. A memory
+//! with no `soul/init-shard.md` starts shards blank, as before.
 //!
 //! **Folder trust.** Claude Code asks "do you trust this folder?" the first
 //! time it runs in a folder, which would stop every new worktree. It keeps
@@ -105,12 +110,13 @@ pub enum ShardStart {
     },
 }
 
-/// How a shard's session is started. Today only [`ShardLaunch::Blank`];
-/// an init (soul, profile, first message) will be a second variant here.
-#[derive(Debug, Clone, Copy)]
+/// How a shard's session is started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShardLaunch {
-    /// No first message.
+    /// No init and no first message.
     Blank,
+    /// The shard's init and its session context, as its first context.
+    Init,
 }
 
 /// The tmux session name for a shard (tmux turns `.` into `_`, which shard
@@ -138,9 +144,12 @@ impl ShardPane {
 
     /// Type the launch line and wait until the agent is ready for a
     /// message. A trust (or other) question on the screen fails at once.
-    fn launch(&self, launch: &Launch) -> Result<Option<String>> {
+    fn launch(&self, launch: &Launch, init: Option<&std::path::Path>) -> Result<Option<String>> {
         self.pane.ensure_pane().map_err(session_err)?;
-        let line = self.adapter.launch_line(&self.command, launch);
+        let in_launch = self.adapter.init_in_launch();
+        let line = self
+            .adapter
+            .launch_line(&self.command, launch, init.filter(|_| in_launch));
         self.pane.type_line(&line).map_err(session_err)?;
         let timeout = self.pane.start_timeout;
         if !self.pane.wait_alive(timeout) {
@@ -152,7 +161,14 @@ impl ShardPane {
         loop {
             let screen = self.pane.tmux.capture().unwrap_or_default();
             match self.adapter.screen(&screen) {
-                Screen::Ready => return Ok(None),
+                Screen::Ready => {
+                    if let (Some(f), false) = (init, in_launch) {
+                        self.pane
+                            .type_line(&format!("[INIT] read {} and follow it", f.display()))
+                            .map_err(session_err)?;
+                    }
+                    return Ok(None);
+                }
                 Screen::Blocked(why) => {
                     return Err(Error::Session(format!(
                         "{why}; nobody is there to answer, so the session was stopped"
@@ -273,6 +289,28 @@ impl Memory {
             command: cfg.shards.command.clone(),
             worktree: meta.worktree.clone(),
         })
+    }
+
+    /// Write the shard's init (main's soul, then its context) for this
+    /// launch, and return the file. `None` for a blank launch or a memory
+    /// with no `soul/init-shard.md`.
+    fn write_shard_init(&self, id: &str, launch: ShardLaunch) -> Result<Option<PathBuf>> {
+        let path = self.sessions_dir().join(format!("{id}.init.md"));
+        let text = match launch {
+            ShardLaunch::Blank => None,
+            ShardLaunch::Init => self.shard_init(id)?,
+        };
+        match text {
+            Some(t) => {
+                fs::create_dir_all(self.sessions_dir())?;
+                fs::write(&path, t)?;
+                Ok(Some(path))
+            }
+            None => {
+                let _ = fs::remove_file(&path);
+                Ok(None)
+            }
+        }
     }
 
     fn sessions_dir(&self) -> PathBuf {
@@ -416,13 +454,18 @@ impl Memory {
                 stopped_at: None,
             }
         })?;
-        let ShardLaunch::Blank = launch;
-        match sp.launch(&Launch::Blank { id: sid.as_deref() }) {
+        let init = main.write_shard_init(&id, launch)?;
+        match sp.launch(&Launch::Blank { id: sid.as_deref() }, init.as_deref()) {
             Ok(note) => {
                 main.session_log(
                     &id,
                     &format!(
-                        "started blank session {}",
+                        "started {} session {}",
+                        if init.is_some() {
+                            "with its init, a"
+                        } else {
+                            "blank"
+                        },
                         sid.as_deref().unwrap_or("(no id)")
                     ),
                 );
@@ -478,10 +521,12 @@ impl Memory {
                 ),
             ),
         };
-        let ShardLaunch::Blank = launch;
+        // A resume passes the init again, as the system prompt, never as a
+        // chat message: the session holds it once (see the adapter).
+        let init = self.write_shard_init(id, launch)?;
         let res = match &launch_as {
-            Some(sid) => sp.launch(&Launch::Resume { id: sid }),
-            None => sp.launch(&Launch::Blank { id: sid.as_deref() }),
+            Some(sid) => sp.launch(&Launch::Resume { id: sid }, init.as_deref()),
+            None => sp.launch(&Launch::Blank { id: sid.as_deref() }, init.as_deref()),
         };
         match res {
             Ok(n) => {

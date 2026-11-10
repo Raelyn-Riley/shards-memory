@@ -357,11 +357,17 @@ pub fn fake_transcript(
 /// folder" question and wait).
 pub const FAKE_CORE: &str = r#"#!/bin/sh
 projects=$1; ctl=$2; shift 2
-echo "args: $*" >> "$ctl/starts.log"
-id=""; resume=""
-if [ "$1" = "--resume" ]; then id=$2; resume=1; shift 2; fi
-if [ "$1" = "--session-id" ]; then id=$2; shift 2; fi
-[ "$1" = "--" ] && shift
+id=""; resume=""; sys=""; has_sys=""; logged=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --resume) id=$2; resume=1; logged="$logged --resume $2"; shift 2;;
+    --session-id) id=$2; logged="$logged --session-id $2"; shift 2;;
+    --append-system-prompt) sys=$2; has_sys=1; logged="$logged --append-system-prompt <$(printf %s "$2" | wc -c) bytes>"; shift 2;;
+    --) shift; logged="$logged --"; break;;
+    *) break;;
+  esac
+done
+rest="$*"; echo "args:$logged${rest:+ $rest}" >> "$ctl/starts.log"
 [ -e "$ctl/fail-all" ] && exit 3
 [ -z "$resume" ] && [ -e "$ctl/fail-fresh" ] && exit 4
 [ -z "$id" ] && id=$(cat /proc/sys/kernel/random/uuid)
@@ -374,6 +380,8 @@ if [ -e "$ctl/trust-prompt" ]; then
   read -r answer; exit 0
 fi
 mkdir -p "$projects/$slug"
+# The appended system prompt (an init), kept per launch for the tests.
+[ -n "$has_sys" ] && printf %s "$sys" > "$ctl/system.$id.$(date +%s%N)"
 # Raw terminal and the alternate screen, undone only on a clean exit.
 # Reads block (min 1) as Claude Code's do, except in a busy turn, which needs
 # a clock: then a read gives up after 0.1 s (min 0 time 1).
