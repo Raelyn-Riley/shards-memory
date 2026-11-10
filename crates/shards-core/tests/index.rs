@@ -132,7 +132,7 @@ fn from_a_shard_the_index_marks_its_pending_facts_and_the_core_keeps_the_descrip
         .describe(&addr("shop/hours"), "Opening hours", &shardp("x"))
         .unwrap_err();
     assert!(matches!(e, Error::Description(_)), "{e}");
-    // Main moves after the shard opened: the shard still sees it.
+    // Main moves after the shard opened.
     mem.set_described(
         &addr("devices/saw1/ip"),
         "10.77.0.31",
@@ -149,7 +149,16 @@ fn from_a_shard_the_index_marks_its_pending_facts_and_the_core_keeps_the_descrip
         Some("IP address of lathe 2's controller")
     );
     assert_eq!(get("shop/hours").pending, Some("changed"));
-    assert_eq!(get("devices/saw1/ip").pending, None);
+    // A shard reads its own branch until it dinits: a fact that reached
+    // main after it opened isn't listed, because `get` can't read it there.
+    assert!(idx.iter().all(|e| e.address != "devices/saw1/ip"));
+    for e in idx.iter().filter(|e| e.pending != Some("removed")) {
+        assert!(
+            s1.get(&addr(&e.address)).is_ok(),
+            "{} is listed but not readable",
+            e.address
+        );
+    }
     assert_eq!(get("devices/mill3/ip").pending, None);
     let text = serde_json::to_string(&idx).unwrap();
     assert!(!text.contains("10.77.0.22") && !text.contains("6-14"));

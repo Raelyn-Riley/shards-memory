@@ -11,10 +11,12 @@
 //! `supersede`, editable by the core with `mem describe`. A description
 //! that contains the value is refused when it is written.
 //!
-//! From main it lists main. From a shard's worktree it lists main as it is
-//! now (so facts accepted since the shard opened show up), plus the shard's
-//! own facts that aren't on main yet, marked `pending`: `new`, `changed` or
-//! `removed` on this shard, waiting for its dinit and the core.
+//! From main it lists main. From a shard's worktree it lists what the shard
+//! reads: its own branch, the same view `mem get` has there. A shard reads
+//! its own branch until it dinits, so a fact that reached main after it
+//! opened isn't listed, because `mem get` can't read it there. The shard's
+//! own facts that aren't on main yet are marked `pending`: `new`, `changed`
+//! or `removed` on this shard, waiting for its dinit and the core.
 
 use serde::Serialize;
 
@@ -71,8 +73,9 @@ impl Memory {
     /// with its description and, on a shard, whether it is pending there.
     pub fn index(&self, section: Option<&str>) -> Result<Vec<IndexEntry>> {
         let section = section.unwrap_or("");
+        // What `mem get` reads here: main on main, its branch on a shard.
         let mut entries: std::collections::BTreeMap<String, IndexEntry> = self
-            .index_at("main", section)?
+            .index_at("HEAD", section)?
             .into_iter()
             .map(|(address, description)| {
                 (
@@ -104,18 +107,14 @@ impl Memory {
                 if !in_section(a.as_str(), section) {
                     continue;
                 }
-                let on_main = entries.contains_key(a.as_str());
+                let at_base = self.read_file_at(base, path)?.is_some();
                 let here = self.read_file_at("HEAD", path)?.is_some();
-                let pending = match (here, on_main) {
+                let pending = match (here, at_base) {
                     (true, false) => "new",
                     (true, true) => "changed",
                     (false, _) => "removed",
                 };
-                let description = if here {
-                    self.description_at("HEAD", path)?
-                } else {
-                    entries.get(a.as_str()).and_then(|e| e.description.clone())
-                };
+                let description = self.description_at(if here { "HEAD" } else { base }, path)?;
                 entries.insert(
                     a.to_string(),
                     IndexEntry {

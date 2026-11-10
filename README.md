@@ -67,8 +67,8 @@ Global: `-C, --memory <dir>` (or `SHARDS_MEMORY`) picks the memory and defaults 
 | Command | Example |
 | --- | --- |
 | `mem init <dir>` creates a new memory (`facts/`, `soul/` with `core.md` and the two [inits](#inits), `people/`, README, `.gitignore`, a default `shards.toml`, first commit). | `mem init ~/flock-memory` |
-| `mem get <address>` prints the value, then `home: <path>`. An unknown address exits 1. From a shard, a fact that reached main after the shard opened is read from main, and says so. | `mem get devices/rotoforge-ctl/ip` |
-| `mem index [section] [--json]` lists every fact's address with its one-line description, and **no values**. From a shard, its own facts not on main yet are marked pending. See [The index](#the-index). | `mem index devices` |
+| `mem get <address>` prints the value, then `home: <path>`. An unknown address exits 1. | `mem get devices/rotoforge-ctl/ip` |
+| `mem index [section] [--json]` lists every fact's address with its one-line description, and **no values**. From a shard it lists the shard's own branch (what `mem get` reads there), with its facts not on main yet marked pending. See [The index](#the-index). | `mem index devices` |
 | `mem describe <address> <text> --why ...` changes only a fact's description, on main (the core's to edit). | `mem describe shop/hours "When the shop floor is open" --why "tidy"` |
 | `mem set <address> <value> --why ... [--description ...]` creates a **new** fact. `--description` (or `--desc`) says in one line what the fact is, never its value; `mem index` lists it, and `supersede` keeps it. Every fact and people write needs a `--why`; without one it is refused with a message telling the agent to say why. It refuses only an exact existing address (use `supersede`). Near-duplicates such as the same name elsewhere are left to the later drift checker, which flags them for a human. | `mem set devices/rotoforge-ctl/ip 10.0.4.40 --why "first seen on the bench"` |
 | `mem supersede <address> <value> --why ...` replaces an existing fact's value as one commit that touches only that file. | `mem supersede devices/rotoforge-ctl/ip 10.0.4.41 --why "moved to the new switch"` |
@@ -914,10 +914,11 @@ devices/lathe2/ip         IP address of lathe 2's controller  [pending: new on t
   with `--description`, and the core edits it with `mem describe`. A description that
   contains the value (three characters or more, any case) is refused. `mem set`
   without one works, and says the index will list the fact without one.
-- **From main** it lists main. **From a shard** it lists main as it is now, plus the
-  shard's own facts that aren't on main yet, marked `new`, `changed` or `removed`. A
-  fact that reached main after the shard opened is listed, and `mem get` from the
-  shard reads it from main. `mem get` reads a fact the shard has as the shard has it.
+- **From main** it lists main. **From a shard** it lists the shard's own branch, the
+  same view `mem get` has there, so everything listed can be read. The shard's facts
+  that aren't on main yet are marked `new`, `changed` or `removed`. A shard reads its
+  own branch until it dinits, so a fact that reached main after the shard opened isn't
+  listed there.
 - **From a proposal.** A shard's description travels in its proposal (`description`)
   and reaches main with the fact when the core accepts it. Otherwise the fact keeps
   main's description.
