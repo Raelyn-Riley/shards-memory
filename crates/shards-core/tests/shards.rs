@@ -256,7 +256,8 @@ fn same_fact_on_two_shards_conflicts_and_is_settled_by_a_human() {
             None,
             &Provenance::new("core", Some("Cleo".into()), "s2's switch is the live one"),
         )
-        .unwrap();
+        .unwrap()
+        .commit;
     assert_eq!(val(&mem, "devices/ctl/ip"), "10.0.0.3");
     assert!(!mem.root().join("conflicts/s2").exists());
     let now = mem.get(&addr("devices/ctl/ip")).unwrap();

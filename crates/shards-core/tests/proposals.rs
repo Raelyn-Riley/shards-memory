@@ -316,7 +316,13 @@ fn accept_reject_hold_and_fix_each_work_per_change() {
 
     // Hold: main stays, and it waits for a human.
     assert_eq!(
-        decide(&mem, "p1", temp, Verdict::Hold, "ask Ada which probe"),
+        decide(
+            &mem,
+            "p1",
+            temp,
+            Verdict::Hold("Which probe did you read?".into()),
+            "ask Ada which probe"
+        ),
         ChangeStatus::Held
     );
     assert_eq!(val(&mem, "kiln/east/temp").as_deref(), Some("900"));
@@ -325,7 +331,12 @@ fn accept_reject_hold_and_fix_each_work_per_change() {
         .unwrap_err();
     assert!(e.to_string().contains("held for a human"), "{e}");
     assert!(mem
-        .proposal_decide("p1", Some(temp), &Verdict::Hold, &core("again"))
+        .proposal_decide(
+            "p1",
+            Some(temp),
+            &Verdict::Hold("again?".into()),
+            &core("again")
+        )
         .is_err());
 
     // Fix: accept an edited value; the record keeps both.
@@ -557,8 +568,13 @@ fn a_new_proposal_fires_an_event_that_wakes_the_core() {
     // Fires once while it holds.
     assert!(mem.watch_pass(Utc::now()).unwrap().fired.is_empty());
     // Held for a human: nothing for the core, so the condition clears.
-    mem.proposal_decide("p1", None, &Verdict::Hold, &core("ask Basil"))
-        .unwrap();
+    mem.proposal_decide(
+        "p1",
+        None,
+        &Verdict::Hold("Is that right, Basil?".into()),
+        &core("ask Basil"),
+    )
+    .unwrap();
     assert!(mem.watch_pass(Utc::now()).unwrap().fired.is_empty());
     assert!(!mem
         .watch_state()
