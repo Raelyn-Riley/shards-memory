@@ -879,6 +879,8 @@ fn a_pane_proposes_and_the_core_reviews_each_change() {
         "3",
         "--why",
         "ask Ada herself",
+        "--ask",
+        "Ada wrote her own profile; is it how she wants it?",
     ]));
     assert!(ok(&w.mem(&["board"])).contains("0 pending, 1 held"));
     let e = fails(&w.mem(&["proposal", "reject", "p1", "--change", "3", "--why", "no"]));
@@ -918,4 +920,207 @@ fn a_pane_proposes_and_the_core_reviews_each_change() {
     }
     assert!(ok(&w.mem(&["proposal", "list"])).contains("no open proposals"));
     assert!(ok(&w.mem(&["proposal", "list", "--all"])).contains("p1"));
+}
+
+/// Brief 13: a person settles a conflict from their shard's pane; the pick is
+/// final, an incident records both sides, and the core is woken to read it.
+#[test]
+fn a_person_settles_a_conflict_from_a_pane_and_the_core_reads_the_incident() {
+    let Some(w) = world() else { return };
+    let a = w.start("s1", "Ada");
+    let b = w.start("s2", "Basil");
+    for (env, v, why) in [
+        (&a, "10.0.4.41", "A's switch"),
+        (&b, "10.0.4.99", "B's switch"),
+    ] {
+        ok(&w.pane(env, &["supersede", "devices/kiln-east/ip", v, "--why", why]));
+    }
+    ok(&w.mem(&["dinit", "--id", "s1"]));
+    ok(&w.mem(&["proposal", "accept", "p1", "--why", "A's switch is live"]));
+    ok(&w.pane(&b, &["dinit", "--id", "s2"]));
+    ok(&w.mem(&["watch", "--once"]));
+
+    // A reason is required.
+    let e = fails(&w.pane(
+        &b,
+        &[
+            "resolve-conflict",
+            "devices/kiln-east/ip",
+            "--take",
+            "shard",
+        ],
+    ));
+    assert!(e.contains("--why"), "{e}");
+    // Basil, in his pane, checks the switch: his shard was right.
+    let out = ok(&w.pane(
+        &b,
+        &[
+            "resolve-conflict",
+            "devices/kiln-east/ip",
+            "--take",
+            "shard",
+            "--why",
+            "looked at the switch: it is .99",
+        ],
+    ));
+    assert!(
+        out.contains(
+            "incident i1: two shards conflicted over devices/kiln-east/ip. Basil checked it. shard s2 was correct."
+        ),
+        "{out}"
+    );
+    assert!(ok(&w.mem(&["get", "devices/kiln-east/ip"])).starts_with("10.0.4.99\n"));
+    let show = ok(&w.mem(&["incident", "show", "i1"]));
+    for needle in [
+        "10.0.4.41",
+        "A's switch",
+        "10.0.4.99",
+        "B's switch",
+        "settled:  Basil took shard",
+        "looked at the switch: it is .99",
+        "humans:   Ada, Basil",
+        "shards:   s1, s2",
+    ] {
+        assert!(show.contains(needle), "{needle} not in\n{show}");
+    }
+    let watch = ok(&w.mem(&["watch", "--once"]));
+    assert!(
+        watch.contains("incident: i1 two shards conflicted"),
+        "{watch}"
+    );
+    assert!(ok(&w.mem(&["board"])).contains("recent incidents"));
+    assert!(ok(&w.pane(&b, &["core", "context"])).contains("\"incidents\""));
+
+    // The core adds a note; a shard can't.
+    let e = fails(&w.pane(&b, &["incident", "note", "i1", "x", "--why", "y"]));
+    assert!(e.contains("can't add notes"), "{e}");
+    ok(&w.mem(&[
+        "incident",
+        "note",
+        "i1",
+        "Two switches on the kiln VLAN; worth labelling.",
+        "--why",
+        "second mix-up this month",
+    ]));
+    let show = ok(&w.mem(&["incident", "show", "i1"]));
+    assert!(
+        show.contains("worth labelling") && show.contains("looked at the switch"),
+        "{show}"
+    );
+    assert!(ok(&w.mem(&["incident", "list"])).contains("i1"));
+}
+
+/// Brief 13: a held change becomes an open question. A new shard sees it in
+/// its first context; one person doesn't know, the next answers; the answer
+/// is a proposal, and accepting it closes the question and the held change.
+/// The proposing shard's drafts show in history.
+#[test]
+fn a_held_change_is_asked_in_the_next_pane_and_the_answer_closes_it() {
+    let Some(w) = world() else { return };
+    let a = w.start("s1", "Mike");
+    // Mike's shard drafts twice before settling on a value.
+    for (v, why) in [
+        ("swapped, maybe", "Mike mentioned a swap in passing"),
+        ("replaced 2026-11-03", "Mike said he replaced it on the 3rd"),
+    ] {
+        let verb = if v.starts_with("swapped") {
+            "set"
+        } else {
+            "supersede"
+        };
+        ok(&w.pane(&a, &[verb, "lathe/two/spindle", v, "--why", why]));
+    }
+    ok(&w.pane(&a, &["dinit", "--id", "s1"]));
+    let show = ok(&w.mem(&["proposal", "show", "p1"]));
+    assert!(show.contains("draft 1: swapped, maybe"), "{show}");
+
+    // A hold without an ask is refused; with one, it writes a question.
+    let e = fails(&w.mem(&["proposal", "hold", "p1", "--why", "only in passing"]));
+    assert!(e.contains("--ask"), "{e}");
+    ok(&w.mem(&[
+        "proposal",
+        "hold",
+        "p1",
+        "--change",
+        "1",
+        "--why",
+        "only said in passing",
+        "--ask",
+        "Mike mentioned he replaced the spindle, but only in passing. Would you confirm it so the record knows for sure?",
+    ]));
+    assert!(ok(&w.mem(&["question", "list"])).contains("ask1"));
+    assert!(ok(&w.mem(&["board"])).contains("open questions"));
+
+    // Basil's new shard sees it in its first context, and doesn't know.
+    let b = w.start("s2", "Basil");
+    let ctx = ok(&w.pane(&b, &["shard", "context"]));
+    assert!(ctx.contains("You are shard s2, with Basil."), "{ctx}");
+    assert!(
+        ctx.contains("ask1  about lathe/two/spindle") && ctx.contains("who said it: Mike"),
+        "{ctx}"
+    );
+    ok(&w.pane(
+        &b,
+        &[
+            "question",
+            "dont-know",
+            "ask1",
+            "--why",
+            "Basil was off that week",
+        ],
+    ));
+    ok(&w.pane(&b, &["dinit", "--id", "s2"]));
+    assert!(ok(&w.mem(&["question", "show", "ask1"])).contains("[open]"));
+
+    // Cleo's shard sees who didn't know, asks, and she answers.
+    let c = w.start("s3", "Cleo");
+    let ctx = ok(&w.pane(&c, &["shard", "context"]));
+    assert!(ctx.contains("didn't know: Basil"), "{ctx}");
+    ok(&w.pane(
+        &c,
+        &[
+            "set",
+            "lathe/two/spindle",
+            "replaced 2026-11-03",
+            "--why",
+            "Cleo: yes, she helped him fit it",
+            "--answers",
+            "ask1",
+        ],
+    ));
+    let out = ok(&w.pane(&c, &["dinit", "--id", "s3"]));
+    assert!(
+        out.contains("PROPOSED  facts/lathe/two/spindle.md  (p2"),
+        "{out}"
+    );
+    assert!(ok(&w.mem(&["proposal", "show", "p2"])).contains("answers:  ask1"));
+    assert!(ok(&w.mem(&["question", "show", "ask1"])).contains("answer waiting for the core: p2#1"));
+    let watch = ok(&w.mem(&["watch", "--once"]));
+    assert!(watch.contains("in p2"), "{watch}");
+    assert!(!watch.contains("in p1"), "{watch}");
+
+    ok(&w.mem(&["proposal", "accept", "p2", "--why", "Cleo was there"]));
+    assert!(ok(&w.mem(&["get", "lathe/two/spindle"])).starts_with("replaced 2026-11-03\n"));
+    let q = ok(&w.mem(&["question", "show", "ask1"]));
+    assert!(
+        q.contains("[closed]") && q.contains("closed") && q.contains("by p2#1"),
+        "{q}"
+    );
+    let p1 = ok(&w.mem(&["proposal", "show", "p1"]));
+    assert!(
+        p1.contains("[answered]") && p1.contains("answered by: p2#1"),
+        "{p1}"
+    );
+    assert!(ok(&w.mem(&["question", "list"])).contains("no open questions"));
+
+    // History: main's one version, and Mike's shard's drafts, marked as such.
+    let h = ok(&w.mem(&["history", "lathe/two/spindle"]));
+    assert!(
+        h.contains("p1#1 [answered], proposed by shard s1")
+            && h.contains("drafts: shard s1's earlier versions in p1#1")
+            && h.contains("never on main")
+            && h.contains("draft: swapped, maybe")
+            && h.contains("why: Mike mentioned a swap in passing"),
+        "{h}"
+    );
 }
