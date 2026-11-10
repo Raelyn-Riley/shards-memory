@@ -51,6 +51,9 @@ pub struct Provenance {
     /// Override the timestamp (RFC 3339). `None` = now. Used by the sample
     /// generator so that output is deterministic by seed.
     pub at: Option<String>,
+    /// The open question this change answers (`ask2`), from a shard. It
+    /// rides the commit as `Shards-Answers` and lands in the proposal.
+    pub answers: Option<String>,
 }
 
 impl Provenance {
@@ -60,6 +63,7 @@ impl Provenance {
             human,
             why: why.into(),
             at: None,
+            answers: None,
         }
     }
 
@@ -116,6 +120,9 @@ impl Provenance {
         }
         if !self.why.is_empty() {
             m += &format!("Shards-Why: {}\n", self.why);
+        }
+        if let Some(a) = &self.answers {
+            m += &format!("Shards-Answers: {a}\n");
         }
         m
     }
@@ -204,6 +211,8 @@ This is a shards memory: a git repository of fact files, written only by the
 - `people/` — one profile per person.
 - `conflicts/` — open conflicts from dinits, waiting for a human.
 - `proposals/` — shards' fact and people changes, and every decision on them.
+- `questions/` — held changes, as questions for the next person who can answer.
+- `incidents/` — conflicts a person settled: both sides, who, why, and notes.
 - `shards.toml` — lock, soul-admin, shard, awareness and core settings.
 
 Read with `mem get <address>`; change with `mem set` / `mem supersede`.
@@ -221,8 +230,8 @@ them to report; you read what they are doing.
 What you do:
 
 - **Read the board.** `mem core context` shows every open shard, what it has
-  in flight, overlaps, open conflicts, soul proposals, and the events that
-  are waiting for you.
+  in flight, overlaps, open conflicts, soul proposals, proposals, open
+  questions, recent incidents, and the events that are waiting for you.
 - **Reason.** Decide what matters: two people changing the same fact, a
   shard gone quiet with work in flight, a conflict or proposal waiting for a
   human.
@@ -231,7 +240,16 @@ What you do:
   lists each change with its value and the shard's reason. Decide each one
   with `mem proposal accept|reject|hold <id> --change N --why \"...\"`.
   To fix a value, accept it with `--value <fixed>`. Hold a change that
-  needs a person. Every change is reviewed; nothing is accepted for you.
+  only a person could check, and say what to ask with
+  `--ask \"<question>\"`: the next person who can answer gets asked by
+  their shard. An answer comes back as a proposal citing the question
+  (`answers: ask<n>`); accepting it closes the question and the held change.
+  Every change is reviewed; nothing is accepted for you.
+- **Read incidents.** When a person settles a conflict, their pick is final
+  and goes straight to main; an incident records both sides, who settled it
+  and why. `mem incident show <id>` reads it. If you have something to add,
+  `mem incident note <id> \"...\" --why \"...\"`. Nothing in an incident is
+  ever removed.
 - **Tell people.** Say who should talk to whom, and why, in a sentence.
 - **Write decisions to main.** What you decide and learn goes into the
   memory with `mem set`, `mem supersede` or `mem put`, with a clear `--why`.
@@ -550,6 +568,7 @@ impl Memory {
     pub fn set(&self, address: &Address, value: &str, prov: &Provenance) -> Result<String> {
         check_value(value)?;
         let prov = self.effective(prov, true)?;
+        self.check_answers(&prov, address.as_str())?;
         self.locked_commit(
             "set",
             address.as_str(),
@@ -576,6 +595,7 @@ impl Memory {
     pub fn supersede(&self, address: &Address, value: &str, prov: &Provenance) -> Result<String> {
         check_value(value)?;
         let prov = self.effective(prov, true)?;
+        self.check_answers(&prov, address.as_str())?;
         self.locked_commit(
             "supersede",
             address.as_str(),
@@ -620,6 +640,7 @@ impl Memory {
             ));
         }
         let prov = self.effective(prov, true)?;
+        self.check_answers(&prov, rel_path)?;
         if top == "soul" && self.context == Context::Main {
             self.require_admin(prov.human.as_deref(), "changing the soul on main")?;
         }
@@ -716,7 +737,25 @@ impl Memory {
             Context::Other(b) => return Err(Error::NotOnMain(b.clone())),
         }
         p.validate(need_why)?;
+        if p.answers.as_deref().is_some_and(|a| a.trim().is_empty()) {
+            p.answers = None;
+        }
         Ok(p)
+    }
+
+    /// A write citing an open question (`--answers`): only from a shard, so
+    /// the answer becomes a proposal the core reviews; the question must be
+    /// open, about `target`, and answerable by this person.
+    fn check_answers(&self, prov: &Provenance, target: &str) -> Result<()> {
+        let Some(q) = &prov.answers else {
+            return Ok(());
+        };
+        if !matches!(self.context, Context::Shard(_)) {
+            return Err(Error::BadQuestion(format!(
+                "an answer to {q} goes through a shard, so the core reviews it; run it from a shard"
+            )));
+        }
+        self.check_answer(q, target, prov.human.as_deref())
     }
 
     /// Take the right lock for this worktree, compute the writes with

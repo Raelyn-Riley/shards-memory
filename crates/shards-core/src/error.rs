@@ -67,6 +67,21 @@ pub enum Error {
     #[error("proposal: {0}")]
     Proposal(String),
 
+    #[error("no incident `{0}` (ids look like i3; see `mem incident list`)")]
+    UnknownIncident(String),
+
+    #[error("incident: {0}")]
+    BadIncident(String),
+
+    #[error("no question `{0}` (ids look like ask3; see `mem question list --all`)")]
+    UnknownQuestion(String),
+
+    #[error("question: {0}")]
+    BadQuestion(String),
+
+    #[error("settling a conflict needs the name of the person who checked it: pass --human <name> (or set SHARDS_HUMAN)")]
+    MissingSettler,
+
     #[error("no open conflict for `{0}`")]
     NoConflict(String),
 

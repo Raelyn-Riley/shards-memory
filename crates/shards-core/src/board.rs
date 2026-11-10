@@ -178,6 +178,33 @@ pub struct ProposalRow {
     pub changes: Vec<ProposalChangeRow>,
 }
 
+/// A recent incident: a conflict a person settled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IncidentRow {
+    pub id: String,
+    pub summary: String,
+    pub target: String,
+    /// Who settled it, and when.
+    pub settled_by: String,
+    pub settled_at: String,
+    /// Notes added since (by the core, usually).
+    pub notes: usize,
+}
+
+/// An open question, waiting for the next person who can answer it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QuestionRow {
+    pub id: String,
+    pub ask: String,
+    pub target: String,
+    /// The held change, `p3#2`.
+    pub change: String,
+    /// Who said it.
+    pub said_by: String,
+    /// People asked who didn't know.
+    pub dont_know: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Thresholds {
     pub idle_secs: f64,
@@ -198,6 +225,10 @@ pub struct Board {
     pub soul_proposals: Vec<SoulProposal>,
     /// Fact/people proposals with a change pending or held, oldest first.
     pub proposals: Vec<ProposalRow>,
+    /// Open questions, oldest first.
+    pub questions: Vec<QuestionRow>,
+    /// The most recent incidents, newest first.
+    pub incidents: Vec<IncidentRow>,
 }
 
 fn rfc3339(t: DateTime<Utc>) -> String {
@@ -430,6 +461,37 @@ impl Memory {
             .collect())
     }
 
+    fn open_questions(&self) -> Result<Vec<QuestionRow>> {
+        Ok(self
+            .questions()?
+            .into_iter()
+            .filter(|q| q.is_open())
+            .map(|q| QuestionRow {
+                change: q.held_change(),
+                said_by: q.said_by_human.clone().unwrap_or(q.said_by_shard.clone()),
+                dont_know: q.log.iter().filter(|a| a.kind == "dont-know").count(),
+                id: q.id,
+                ask: q.ask,
+                target: q.target,
+            })
+            .collect())
+    }
+
+    fn incident_rows(&self) -> Result<Vec<IncidentRow>> {
+        Ok(self
+            .recent_incidents()?
+            .into_iter()
+            .map(|i| IncidentRow {
+                settled_by: i.settled.human.clone(),
+                settled_at: i.settled.at.clone(),
+                notes: i.notes.len(),
+                id: i.id,
+                summary: i.summary,
+                target: i.target,
+            })
+            .collect())
+    }
+
     /// Build the board as of `now`. Takes no main or shard lock.
     pub fn board(&self, now: DateTime<Utc>) -> Result<Board> {
         let main = self.main()?;
@@ -459,6 +521,8 @@ impl Memory {
             },
             conflicts: main.open_conflicts()?,
             proposals: main.open_proposals()?,
+            questions: main.open_questions()?,
+            incidents: main.incident_rows()?,
             shards,
             overlaps,
             soul_proposals,

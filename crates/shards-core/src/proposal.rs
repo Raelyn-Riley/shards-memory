@@ -22,7 +22,15 @@
 //!   not write it. It records a **conflict** (`conflicts/<shard>/...`), the
 //!   same record a dinit writes, settled with `mem resolve-conflict`.
 //! - **reject** leaves main alone. **hold** leaves main alone and waits for
-//!   a human: deciding a held change needs a named human.
+//!   a human: deciding a held change needs a named human. A hold must say
+//!   what to ask the next person who can answer (`ask`): it writes an open
+//!   question, `questions/ask<n>.json`, in the same commit (see
+//!   [`crate::question`]). A change that answers a question (`answers`)
+//!   closes it, and marks the held change `answered`, when it is accepted.
+//!
+//! When a shard changed a path more than once before its dinit, every
+//! in-between version and its reason is kept in the change's `drafts`, in
+//! order. Drafts were never on main; they are the shard's whole why.
 //!
 //! Every decision is one commit on main that rewrites the record with the
 //! change's new status and one more entry in its `log`. Nothing is removed
@@ -32,7 +40,7 @@
 //! A shard can't decide proposals: deciding is refused from a shard's
 //! worktree and for the proposing shard's own id as reviewer.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +48,8 @@ use crate::address::Address;
 use crate::error::{Error, Result};
 use crate::fact::{Fact as FactFile, FrontMatter};
 use crate::memory::{now, Context, FileWrite, Memory, Provenance};
+use crate::question::{self, Answer, Closed, Question, QuestionStatus};
+use crate::record;
 use crate::shard::{record_path, target_of, Conflict, Side};
 
 /// The folder on main that holds proposal records.
@@ -82,6 +92,9 @@ pub enum ChangeStatus {
     Rejected,
     /// Main changed the same path first; see `conflict_record`.
     Conflict,
+    /// Held, then settled by an accepted answer to its question; see
+    /// `answered_by`.
+    Answered,
 }
 
 impl ChangeStatus {
@@ -92,6 +105,7 @@ impl ChangeStatus {
             ChangeStatus::Accepted => "accepted",
             ChangeStatus::Rejected => "rejected",
             ChangeStatus::Conflict => "conflict",
+            ChangeStatus::Answered => "answered",
         }
     }
     /// Still to be decided.
@@ -129,6 +143,31 @@ pub struct Change {
     /// The conflict record, when accepting found main had moved.
     #[serde(default)]
     pub conflict_record: Option<String>,
+    /// The shard's earlier versions of this path before the dinit, oldest
+    /// first. Never on main.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drafts: Vec<Draft>,
+    /// The open question this change answers (`ask2`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answers: Option<String>,
+    /// For a held change: the question asked about it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
+    /// For an answered change: the accepted answer, `p4#1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_by: Option<String>,
+}
+
+/// One of the shard's in-between versions of a path, before its dinit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Draft {
+    /// The shard's commit.
+    pub commit: String,
+    /// The value then; null if the shard had removed it.
+    pub value: Option<String>,
+    pub why: String,
+    pub author: String,
+    pub updated: String,
 }
 
 impl Change {
@@ -156,6 +195,10 @@ pub struct Decision {
     pub value: Option<String>,
     #[serde(default)]
     pub record: Option<String>,
+    /// For `hold`: the question it asked. For an accepted or rejected
+    /// answer: the question it answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
 }
 
 /// `proposals/p<n>.json`.
@@ -191,9 +234,11 @@ impl Proposal {
         self.changes.iter().any(|c| c.status.is_open())
     }
     fn render(&self) -> String {
-        let mut s = serde_json::to_string_pretty(self).expect("serializable");
-        s.push('\n');
-        s
+        record::render(self)
+    }
+    /// The change numbered `n`.
+    pub fn change(&self, n: usize) -> Option<&Change> {
+        self.changes.iter().find(|c| c.n == n)
     }
 }
 
@@ -203,7 +248,8 @@ pub enum Verdict {
     /// Accept; `Some(value)` accepts an edited value instead (a fix).
     Accept(Option<String>),
     Reject,
-    Hold,
+    /// Hold for a human, asking this of the next person who can answer.
+    Hold(String),
 }
 
 impl Verdict {
@@ -211,7 +257,7 @@ impl Verdict {
         match self {
             Verdict::Accept(_) => "proposal-accept",
             Verdict::Reject => "proposal-reject",
-            Verdict::Hold => "proposal-hold",
+            Verdict::Hold(_) => "proposal-hold",
         }
     }
 }
@@ -229,48 +275,9 @@ pub fn path_of(id: &str) -> String {
     format!("{DIR}/{id}.json")
 }
 
-fn valid_id(id: &str) -> bool {
-    id.strip_prefix('p')
-        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-}
-
-fn num(id: &str) -> u64 {
-    id.trim_start_matches('p').parse().unwrap_or(0)
-}
-
 impl Memory {
-    /// Proposal ids on `rev`, by number.
-    fn proposal_ids(&self, rev: &str) -> Result<Vec<String>> {
-        let out = self.git.run(&[
-            "ls-tree",
-            "-r",
-            "--name-only",
-            rev,
-            "--",
-            &format!("{DIR}/"),
-        ])?;
-        let mut ids: Vec<String> = out
-            .lines()
-            .filter_map(|l| l.strip_prefix(&format!("{DIR}/"))?.strip_suffix(".json"))
-            .filter(|id| valid_id(id))
-            .map(String::from)
-            .collect();
-        ids.sort_by_key(|id| num(id));
-        Ok(ids)
-    }
-
     fn proposal_at(&self, rev: &str, id: &str) -> Result<Proposal> {
-        if !valid_id(id) {
-            return Err(Error::UnknownProposal(id.to_string()));
-        }
-        let path = path_of(id);
-        let text = self
-            .read_file_at(rev, &path)?
-            .ok_or_else(|| Error::UnknownProposal(id.to_string()))?;
-        serde_json::from_str(&text).map_err(|e| Error::Malformed {
-            path,
-            reason: e.to_string(),
-        })
+        self.record_at(rev, DIR, "p", id, Error::UnknownProposal)
     }
 
     /// One proposal, read from main (from any worktree).
@@ -280,7 +287,7 @@ impl Memory {
 
     /// Every proposal on main, oldest first.
     pub fn proposals(&self) -> Result<Vec<Proposal>> {
-        self.proposal_ids("main")?
+        self.record_ids("main", DIR, "p")?
             .iter()
             .map(|id| self.proposal_at("main", id))
             .collect()
@@ -294,15 +301,11 @@ impl Memory {
         shard: &str,
         human: Option<&str>,
         main_head: &str,
+        base: &str,
         tip: &str,
         paths: &[String],
     ) -> Result<Proposal> {
-        let next = self
-            .proposal_ids(main_head)?
-            .last()
-            .map(|id| num(id))
-            .unwrap_or(0)
-            + 1;
+        let id = self.next_record_id(main_head, DIR, "p")?;
         let mut changes = Vec::new();
         for (i, p) in paths.iter().enumerate() {
             let address = Address::from_home(p).map(|a| a.to_string());
@@ -315,6 +318,7 @@ impl Memory {
                 (true, false, _) => ChangeOp::Put,
             };
             let side = self.side(tip, p)?;
+            let (drafts, answers) = self.drafts_of(base, tip, p)?;
             changes.push(Change {
                 n: i + 1,
                 op,
@@ -332,11 +336,15 @@ impl Memory {
                 status: ChangeStatus::Pending,
                 accepted_value: None,
                 conflict_record: None,
+                drafts,
+                answers,
+                question: None,
+                answered_by: None,
             });
         }
         Ok(Proposal {
             format: FORMAT,
-            id: format!("p{next}"),
+            id,
             shard: shard.to_string(),
             human: human.map(String::from),
             created: now(),
@@ -345,6 +353,54 @@ impl Memory {
             changes,
             log: Vec::new(),
         })
+    }
+
+    /// The shard's versions of `path` from `base` to `tip`, oldest first:
+    /// every one but the last (the proposed value) is a draft. Also the
+    /// latest question any of them cited with `--answers`.
+    fn drafts_of(&self, base: &str, tip: &str, path: &str) -> Result<(Vec<Draft>, Option<String>)> {
+        let out = self.git.run(&[
+            "log",
+            "--reverse",
+            "--topo-order",
+            "--format=%H%x00%(trailers:key=Shards-Answers,valueonly,separator=)",
+            &format!("{base}..{tip}"),
+            "--",
+            path,
+        ])?;
+        let mut versions = Vec::new();
+        let mut answers = None;
+        for line in out.lines().filter(|l| !l.trim().is_empty()) {
+            let (commit, ans) = line.split_once('\0').unwrap_or((line, ""));
+            if !ans.trim().is_empty() {
+                answers = Some(ans.trim().to_string());
+            }
+            let text = self.read_file_at(commit, path)?;
+            let side = self.side(commit, path)?;
+            versions.push(Draft {
+                commit: commit.to_string(),
+                value: text.map(|_| side.value.clone()),
+                why: side.why,
+                author: side.author,
+                updated: side.updated,
+            });
+        }
+        versions.pop();
+        Ok((versions, answers))
+    }
+
+    /// Every change on main that drafted `target` (a fact address or a
+    /// repo path), oldest proposal first: `(proposal, change)`.
+    pub fn drafts_for(&self, target: &str) -> Result<Vec<(Proposal, Change)>> {
+        let mut out = Vec::new();
+        for p in self.main()?.proposals()? {
+            for c in &p.changes {
+                if c.target() == target && !c.drafts.is_empty() {
+                    out.push((p.clone(), c.clone()));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// The text of a proposal record, for the dinit's merge tree.
@@ -372,15 +428,31 @@ impl Memory {
             prov.author = "core".to_string();
         }
         let prov = main.effective(&prov, true)?;
-        if let Verdict::Accept(Some(v)) = verdict {
-            if change.is_none() {
-                return Err(Error::Proposal(
-                    "an edited value fixes one change: pass --change N with --value".into(),
-                ));
+        match verdict {
+            Verdict::Accept(Some(v)) => {
+                if change.is_none() {
+                    return Err(Error::Proposal(
+                        "an edited value fixes one change: pass --change N with --value".into(),
+                    ));
+                }
+                if v.trim().is_empty() {
+                    return Err(Error::EmptyValue);
+                }
             }
-            if v.trim().is_empty() {
-                return Err(Error::EmptyValue);
+            Verdict::Hold(ask) => {
+                if ask.trim().is_empty() {
+                    return Err(Error::Proposal(
+                        "a hold needs --ask \"<question>\": what to ask the next person who can \
+                         answer it, e.g. --ask \"Mike mentioned he replaced the spindle, but only \
+                         in passing. Would you confirm it so the record knows for sure?\""
+                            .into(),
+                    ));
+                }
+                if ask.contains('\n') || ask.contains('\r') {
+                    return Err(Error::Multiline { field: "ask" });
+                }
             }
+            _ => {}
         }
         // Lock what this decision may write, from the record as it stands;
         // everything is checked again under the lock.
@@ -394,6 +466,15 @@ impl Memory {
         let mut lock_paths: Vec<String> = before.changes.iter().map(|c| c.path.clone()).collect();
         lock_paths.push(before.path());
         lock_paths.push(format!("conflicts/{}/x", before.shard));
+        lock_paths.push(format!("{}/_", question::DIR));
+        for c in &before.changes {
+            for q in c.answers.iter().chain(c.question.iter()) {
+                lock_paths.push(question::path_of(q));
+                if let Ok(q) = main.question(q) {
+                    lock_paths.push(path_of(&q.proposal));
+                }
+            }
+        }
 
         let mut outcome = Vec::new();
         let mut trailers = vec![
@@ -408,6 +489,9 @@ impl Memory {
                 trailers.push(("Change", format!("{} {}", c.n, c.target())));
                 trailers.push(("Shard-Why", format!("{}: {}", c.n, c.why)));
             }
+        }
+        if let Verdict::Hold(ask) = verdict {
+            trailers.push(("Ask", ask.clone()));
         }
         let commit = main.locked_commit(
             verdict.op(),
@@ -463,6 +547,13 @@ impl Memory {
         }
         let mut writes: Vec<FileWrite> = Vec::new();
         let mut seen_records = BTreeSet::new();
+        // Questions and other proposals this decision touches.
+        let mut questions: BTreeMap<String, Question> = BTreeMap::new();
+        let mut others: BTreeMap<String, Proposal> = BTreeMap::new();
+        let mut next_q = record::num(
+            question::PREFIX,
+            &self.next_record_id("HEAD", question::DIR, question::PREFIX)?,
+        );
         for n in targets {
             let c = p.changes.iter_mut().find(|c| c.n == n).expect("listed");
             if c.status == ChangeStatus::Held && prov.human.is_none() {
@@ -470,6 +561,7 @@ impl Memory {
                     "change {n} of {id} is held for a human: pass --human <name> to decide it"
                 )));
             }
+            let was_held = c.status == ChangeStatus::Held;
             let mut d = Decision {
                 at: at.clone(),
                 change: n,
@@ -479,20 +571,50 @@ impl Memory {
                 why: prov.why.clone(),
                 value: None,
                 record: None,
+                question: None,
             };
             match verdict {
                 Verdict::Reject => {
                     c.status = ChangeStatus::Rejected;
                     d.action = "reject".into();
                 }
-                Verdict::Hold => {
+                Verdict::Hold(ask) => {
                     if c.status == ChangeStatus::Held {
                         return Err(Error::Proposal(format!(
                             "change {n} of {id} is already held"
                         )));
                     }
+                    let qid = format!("{}{next_q}", question::PREFIX);
+                    next_q += 1;
+                    questions.insert(
+                        qid.clone(),
+                        Question {
+                            format: question::FORMAT,
+                            id: qid.clone(),
+                            ask: ask.trim().to_string(),
+                            status: QuestionStatus::Open,
+                            created: at.clone(),
+                            proposal: id.to_string(),
+                            change: n,
+                            target: c.target().to_string(),
+                            path: c.path.clone(),
+                            value: c.value.clone(),
+                            said_by_shard: p.shard.clone(),
+                            said_by_human: p.human.clone(),
+                            said_why: c.why.clone(),
+                            held_by: match &prov.human {
+                                Some(h) => format!("{} / {h}", prov.author),
+                                None => prov.author.clone(),
+                            },
+                            held_why: prov.why.clone(),
+                            log: Vec::new(),
+                            closed: None,
+                        },
+                    );
                     c.status = ChangeStatus::Held;
+                    c.question = Some(qid.clone());
                     d.action = "hold".into();
+                    d.question = Some(qid);
                 }
                 Verdict::Accept(edit) => {
                     if edit.is_some() && c.op == ChangeOp::Remove {
@@ -566,6 +688,94 @@ impl Memory {
                     }
                 }
             }
+            let this = format!("{id}#{n}");
+            let decided = matches!(d.action.as_str(), "accept" | "fix" | "reject");
+            // A held change decided directly by a human closes its question.
+            if let (true, true, Some(q)) = (was_held, decided, c.question.clone()) {
+                let q = load_question(self, &mut questions, &q)?;
+                if q.is_open() {
+                    q.log.push(Answer {
+                        at: at.clone(),
+                        kind: "held-change-decided".into(),
+                        by: prov.author.clone(),
+                        human: prov.human.clone(),
+                        why: prov.why.clone(),
+                        change: Some(this.clone()),
+                    });
+                    q.status = QuestionStatus::Closed;
+                    q.closed = Some(Closed {
+                        at: at.clone(),
+                        by_change: this.clone(),
+                        action: d.action.clone(),
+                        by: prov.author.clone(),
+                        human: prov.human.clone(),
+                        why: prov.why.clone(),
+                        value: c.accepted_value.clone(),
+                    });
+                }
+            }
+            // An answer to an open question.
+            if let Some(qid) = c.answers.clone() {
+                let q = load_question(self, &mut questions, &qid)?;
+                if q.is_open() {
+                    d.question = Some(qid.clone());
+                    let kind = match d.action.as_str() {
+                        "accept" | "fix" => "answer-accepted",
+                        "reject" => "answer-rejected",
+                        "hold" => "answer-held",
+                        _ => "answer-conflict",
+                    };
+                    q.log.push(Answer {
+                        at: at.clone(),
+                        kind: kind.into(),
+                        by: prov.author.clone(),
+                        human: prov.human.clone(),
+                        why: prov.why.clone(),
+                        change: Some(this.clone()),
+                    });
+                    if kind == "answer-accepted" {
+                        q.status = QuestionStatus::Closed;
+                        q.closed = Some(Closed {
+                            at: at.clone(),
+                            by_change: this.clone(),
+                            action: d.action.clone(),
+                            by: prov.author.clone(),
+                            human: prov.human.clone(),
+                            why: prov.why.clone(),
+                            value: c.accepted_value.clone(),
+                        });
+                        let (held_p, held_n) = (q.proposal.clone(), q.change);
+                        let note = format!("{qid} answered by {this}: {}", prov.why);
+                        let mark = |hp: &mut Proposal| {
+                            if let Some(h) = hp.changes.iter_mut().find(|h| h.n == held_n) {
+                                if h.status == ChangeStatus::Held {
+                                    h.status = ChangeStatus::Answered;
+                                    h.answered_by = Some(this.clone());
+                                    hp.log.push(Decision {
+                                        at: at.clone(),
+                                        change: held_n,
+                                        action: "answered".into(),
+                                        by: prov.author.clone(),
+                                        human: prov.human.clone(),
+                                        why: note.clone(),
+                                        value: c.accepted_value.clone(),
+                                        record: None,
+                                        question: Some(qid.clone()),
+                                    });
+                                }
+                            }
+                        };
+                        // The question was asked after this proposal's held
+                        // change, so an answer is always in a later proposal.
+                        if held_p != id {
+                            if !others.contains_key(&held_p) {
+                                others.insert(held_p.clone(), self.proposal_at("HEAD", &held_p)?);
+                            }
+                            mark(others.get_mut(&held_p).expect("loaded"));
+                        }
+                    }
+                }
+            }
             outcome.push((
                 n,
                 c.target().to_string(),
@@ -575,18 +785,24 @@ impl Memory {
             p.log.push(d);
         }
         writes.push((p.path(), Some(p.render())));
+        for o in others.into_values() {
+            writes.push((o.path(), Some(o.render())));
+        }
+        for q in questions.values() {
+            writes.push((q.path(), Some(record::render(q))));
+        }
         Ok(writes)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ids() {
-        assert!(valid_id("p1") && valid_id("p12"));
-        assert!(!valid_id("p") && !valid_id("q1") && !valid_id("p1/../x"));
-        assert_eq!(num("p12"), 12);
+/// A question this decision touches, loaded once from HEAD.
+fn load_question<'a>(
+    m: &Memory,
+    qs: &'a mut BTreeMap<String, Question>,
+    id: &str,
+) -> Result<&'a mut Question> {
+    if !qs.contains_key(id) {
+        qs.insert(id.to_string(), m.question_at("HEAD", id)?);
     }
+    Ok(qs.get_mut(id).expect("loaded"))
 }

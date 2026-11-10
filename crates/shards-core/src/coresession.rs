@@ -291,7 +291,9 @@ pub fn first_message(root: &Path, baton: Option<&str>) -> String {
         "You are the shards core for the memory at {}. Read soul/core.md and the rest of \
          soul/, then run `mem core context`. A line starting with [WAKE] means events are \
          pending: run `mem core context`, reason, review proposals with `mem proposal show` \
-         and `mem proposal accept|reject|hold`, tell people, write decisions to main, then \
+         and `mem proposal accept|reject|hold` (a hold needs --ask, the question for the next \
+         person), read new incidents with `mem incident show`, tell people, write decisions \
+         to main, then \
          run `mem core ack --upto <n>` with the number from the [WAKE] line. A message that \
          is exactly [HH:MM] is a heartbeat: reply with one character and do nothing else.",
         root.display()

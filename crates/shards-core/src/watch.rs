@@ -71,6 +71,8 @@ pub enum EventKind {
     SoulProposal,
     /// A shard's fact/people proposal waits for the core.
     Proposal,
+    /// A person settled a conflict; the incident is new.
+    Incident,
     /// The core watchdog gave up restoring the core.
     CoreDown,
 }
@@ -84,6 +86,7 @@ impl EventKind {
             EventKind::OpenConflict => "open-conflict",
             EventKind::SoulProposal => "soul-proposal",
             EventKind::Proposal => "proposal",
+            EventKind::Incident => "incident",
             EventKind::CoreDown => "core-down",
         }
     }
@@ -235,6 +238,23 @@ pub fn conditions(board: &Board, t: &TriggersConfig) -> Vec<Condition> {
                     p.id
                 ),
                 addresses: targets,
+            });
+        }
+    }
+    if t.incident {
+        // Recent incidents only: each fires once, and drops out of the
+        // conditions once newer ones push it off the board.
+        for i in &board.incidents {
+            out.push(Condition {
+                kind: EventKind::Incident,
+                key: format!("incident:{}", i.id),
+                shards: Vec::new(),
+                addresses: vec![i.target.clone()],
+                humans: vec![i.settled_by.clone()],
+                summary: format!(
+                    "{} {}; read it with mem incident show {} and add a note if you want (mem incident note {} \"...\" --why \"...\")",
+                    i.id, i.summary, i.id, i.id
+                ),
             });
         }
     }

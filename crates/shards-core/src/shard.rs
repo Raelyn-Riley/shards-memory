@@ -40,6 +40,7 @@ use crate::address::Address;
 use crate::error::{Error, Result};
 use crate::fact::{parse_front, render_front, Fact as FactFile};
 use crate::git::Opts;
+use crate::incident::{Incident, IncidentSide, Settlement};
 use crate::memory::{fact_file, now, FileWrite, Memory, Provenance};
 
 /// What `.shards/shards/<id>.json` records about an open shard.
@@ -125,6 +126,14 @@ pub struct DinitReport {
     pub kept_open: Option<String>,
     /// A clean dinit stopped the shard's running session.
     pub session_stopped: bool,
+}
+
+/// What settling a conflict did.
+#[derive(Debug, Clone)]
+pub struct Resolution {
+    pub commit: String,
+    /// The incident written for it, e.g. `i3`.
+    pub incident: String,
 }
 
 /// How to settle a conflict.
@@ -531,7 +540,7 @@ impl Memory {
         let proposal = if propose.is_empty() {
             None
         } else {
-            Some(main.build_proposal(id, human, &main_head, &tip, &propose)?)
+            Some(main.build_proposal(id, human, &main_head, &base, &tip, &propose)?)
         };
 
         let tip_merged = main
@@ -635,6 +644,7 @@ impl Memory {
                 human: meta.human.clone(),
                 why: format!("dinit of shard {id}"),
                 at: Some(now()),
+                answers: None,
             };
             let msg = prov.message("dinit", id, &trailers);
             let msg = msg.replacen("\n\n", &format!("\n\n{summary}"), 1);
@@ -758,17 +768,31 @@ impl Memory {
             .collect())
     }
 
-    /// Settle a conflict on main. Writes the chosen value (unless `main`),
-    /// removes the record, one commit carrying the why.
+    /// Settle a conflict on main. A person's pick is final: the chosen value
+    /// goes to main (unless `main`) with no proposal review, the record is
+    /// removed, and an incident (`incidents/i<n>.json`) is written, all in
+    /// one commit. Needs the settler's name (`prov.human`) and a reason.
     pub fn resolve_conflict(
         &self,
         target: &str,
         take: &Take,
         shard: Option<&str>,
         prov: &Provenance,
-    ) -> Result<String> {
+    ) -> Result<Resolution> {
         let main = self.main()?;
-        let prov = main.effective(prov, true)?;
+        // Author rules are this worktree's: from a shard, the shard id, and
+        // the settler defaults to the shard's human.
+        let mut prov = prov.clone();
+        if prov.author.trim().is_empty() && matches!(self.context, crate::memory::Context::Main) {
+            prov.author = prov.human.clone().unwrap_or_default();
+            if prov.author.trim().is_empty() {
+                return Err(Error::MissingSettler);
+            }
+        }
+        let prov = self.effective(&prov, true)?;
+        if prov.human.as_deref().is_none_or(|h| h.trim().is_empty()) {
+            return Err(Error::MissingSettler);
+        }
         let mut found = main.conflicts_for(target)?;
         if let Some(s) = shard {
             found.retain(|(id, _)| id == s);
@@ -794,15 +818,26 @@ impl Memory {
                 .map(|(_, v)| v.clone())
                 .unwrap_or_default()
         };
+        let side = |pre: &str| IncidentSide {
+            value: get(&format!("{pre}_value")),
+            author: get(&format!("{pre}_author")),
+            human: Some(get(&format!("{pre}_human"))).filter(|h| !h.is_empty()),
+            updated: get(&format!("{pre}_updated")),
+            why: get(&format!("{pre}_why")),
+        };
+        let (main_side, shard_side) = (side("main"), side("shard"));
         let path = get("path");
-        let shard_value = get("shard_value");
+        let shard_value = shard_side.value.clone();
+        let incident_lock = format!("{}/_", crate::incident::DIR);
         let trailers = vec![
             ("Target", target.to_string()),
             ("Shard", sid.clone()),
             ("Take", take.label().to_string()),
         ];
-        let lock_paths = vec![path.clone(), record.clone()];
-        main.locked_commit(
+        let lock_paths = vec![path.clone(), record.clone(), incident_lock];
+        // The incident id is only known under the lock.
+        let mut incident_id = String::new();
+        let commit = main.locked_commit(
             "resolve-conflict",
             target,
             &lock_paths,
@@ -815,19 +850,78 @@ impl Memory {
                     Take::Shard => Some(shard_value.clone()),
                     Take::Value(v) => Some(v.clone()),
                 };
-                if let Some(v) = value {
+                if let Some(v) = &value {
                     if path.starts_with("soul/") {
                         m.require_admin(prov.human.as_deref(), "changing the soul on main")?;
                     }
                     let contents = match Address::from_home(&path) {
-                        Some(a) => fact_file(&a, &v, prov),
-                        None => v,
+                        Some(a) => fact_file(&a, v, prov),
+                        None => v.clone(),
                     };
                     writes.insert(0, (path.clone(), Some(contents)));
                 }
+                let human = prov.human.clone().unwrap_or_default();
+                let mut settled = Settlement {
+                    take: take.label().to_string(),
+                    value: value.unwrap_or_else(|| main_side.value.clone()),
+                    correct: match take {
+                        Take::Shard => format!("shard {sid}"),
+                        Take::Main => "main".to_string(),
+                        Take::Value(_) => "neither".to_string(),
+                    },
+                    human: human.clone(),
+                    by: prov.author.clone(),
+                    why: prov.why.clone(),
+                    at: prov.timestamp(),
+                };
+                if let (Take::Main, false) = (take, main_side.author.is_empty()) {
+                    settled.correct = format!("main (by {})", main_side.author);
+                }
+                let mut shards = Vec::new();
+                for s in [&main_side.author, &sid] {
+                    if !s.is_empty() && !shards.contains(s) {
+                        shards.push(s.clone());
+                    }
+                }
+                let mut humans = Vec::new();
+                for h in [
+                    main_side.human.as_ref(),
+                    shard_side.human.as_ref(),
+                    Some(&human),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if !h.is_empty() && !humans.contains(h) {
+                        humans.push(h.clone());
+                    }
+                }
+                let id = m.next_record_id("HEAD", crate::incident::DIR, crate::incident::PREFIX)?;
+                let inc = Incident {
+                    format: crate::incident::FORMAT,
+                    summary: crate::incident::summary(target, &sid, &main_side.author, &settled),
+                    id: id.clone(),
+                    target: target.to_string(),
+                    path: path.clone(),
+                    conflict_record: record.clone(),
+                    conflict_recorded: get("recorded"),
+                    shard: sid.clone(),
+                    main: main_side.clone(),
+                    shard_side: shard_side.clone(),
+                    shards,
+                    humans,
+                    settled,
+                    notes: Vec::new(),
+                };
+                writes.push((inc.path(), Some(crate::record::render(&inc))));
+                incident_id = id;
                 Ok(writes)
             },
-        )
+        )?;
+        Ok(Resolution {
+            commit,
+            incident: incident_id,
+        })
     }
 
     /// An admin approves a shard's pending soul proposal: the shard's soul
