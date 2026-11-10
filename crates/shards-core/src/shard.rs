@@ -914,6 +914,9 @@ impl Memory {
                     notes: Vec::new(),
                 };
                 writes.push((inc.path(), Some(crate::record::render(&inc))));
+                // A person settled it: newer information about this fact,
+                // so whatever waited on it is fixed, linked to the incident.
+                m.close_superseded(&mut writes, std::slice::from_ref(&path), &id, prov)?;
                 incident_id = id;
                 Ok(writes)
             },

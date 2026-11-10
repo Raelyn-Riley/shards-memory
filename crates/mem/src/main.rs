@@ -939,6 +939,9 @@ fn print_proposal(out: &mut impl Write, p: &Proposal) -> io::Result<()> {
         if let Some(a) = &c.answered_by {
             writeln!(out, "      answered by: {a}")?;
         }
+        if let Some(f) = &c.fixed_by {
+            writeln!(out, "      fixed by: {f} (newer information on main)")?;
+        }
         for (i, d) in c.drafts.iter().enumerate() {
             writeln!(
                 out,

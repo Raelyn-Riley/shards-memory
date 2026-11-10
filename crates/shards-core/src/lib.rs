@@ -52,4 +52,4 @@ pub use question::{Answer, Question, QuestionStatus};
 pub use quirk::{NewQuirk, Quirk, QuirkState, QuirkVersion};
 pub use shard::{Conflict, DinitReport, Resolution, ShardInfo, ShardMeta, ShardStatus, Side, Take};
 pub use shardsession::{PaneState, ShardSession, ShardStart};
-pub use watch::{CoreContext, Event, PassReport, WakeOutcome};
+pub use watch::{CoreContext, Event, PassReport, WakeOutcome, CHECK_RULE};

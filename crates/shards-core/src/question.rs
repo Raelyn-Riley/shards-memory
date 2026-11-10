@@ -24,6 +24,12 @@
 //!   records it straight on main and the question stays open.
 //! - A human deciding the held change directly (`mem proposal accept ...
 //!   --human`) closes the question too.
+//! - **Superseded is fixed.** When the fact a question is about gets newer
+//!   information on main (an accepted change from anyone, a settled
+//!   conflict, a write on main), the question closes as `fixed`, linked to
+//!   what fixed it (`p4#1`, `i2`, or the write), and its held change becomes
+//!   `fixed` too. Logged on both, in the same commit as the new information.
+//!   See [`Memory::close_superseded`].
 //!
 //! Who may answer is decided in one place, [`Memory::may_answer`]. For now,
 //! anyone may.
@@ -31,7 +37,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::memory::{Memory, Provenance};
+use crate::memory::{Context, FileWrite, Memory, Provenance};
+use crate::proposal::{self, ChangeStatus, Decision, Proposal};
 use crate::record;
 
 /// The folder on main that holds questions.
@@ -59,8 +66,8 @@ impl QuestionStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Answer {
     pub at: String,
-    /// `dont-know`, `answer-rejected`, `answer-held`, `answer-accepted`, or
-    /// `held-change-decided`.
+    /// `dont-know`, `answer-rejected`, `answer-held`, `answer-accepted`,
+    /// `held-change-decided`, or `fixed` (newer information on main).
     pub kind: String,
     /// The shard that asked, or the reviewer.
     pub by: String,
@@ -75,10 +82,11 @@ pub struct Answer {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Closed {
     pub at: String,
-    /// The change whose decision closed it: the answer (`p4#1`), or the held
-    /// change itself when a human decided it directly.
+    /// What closed it: the answer (`p4#1`), the held change itself when a
+    /// human decided it directly, or, for `fixed`, what put newer
+    /// information on main (`p4#1`, an incident `i2`, or a write on main).
     pub by_change: String,
-    /// `accept`, `fix`, `reject`.
+    /// `accept`, `fix`, `reject`, or `fixed`.
     pub action: String,
     /// The reviewer.
     pub by: String,
@@ -236,6 +244,137 @@ impl Memory {
         )
     }
 
+    /// Newer information on main about `paths` (facts/ or people/ files)
+    /// fixes what was waiting on them: every held change on one of those
+    /// paths becomes `fixed` (`fixed_by`), and every open question about
+    /// one closes as `fixed`, linked to `by`. Called from the same
+    /// `prepare` that writes the new information, so it lands in the same
+    /// commit. It takes no proposals/questions section lock (that would make
+    /// every fact write on main exclusive, whatever the lock scope): it only
+    /// rewrites records that already exist, and `prepare` runs under the git
+    /// mutex, which every read-modify-write of a record on main also holds.
+    /// Records already in `writes` are read from there.
+    /// Only on main; a shard's writes aren't on main yet.
+    pub(crate) fn close_superseded(
+        &self,
+        writes: &mut Vec<FileWrite>,
+        paths: &[String],
+        by: &str,
+        prov: &Provenance,
+    ) -> Result<()> {
+        if self.context != Context::Main {
+            return Ok(());
+        }
+        let paths: Vec<&String> = paths
+            .iter()
+            .filter(|p| p.starts_with("facts/") || p.starts_with("people/"))
+            .collect();
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let current = |writes: &Vec<FileWrite>, path: &str| -> Result<Option<String>> {
+            match writes.iter().find(|(p, _)| p == path) {
+                Some((_, c)) => Ok(c.clone()),
+                None => self.read_file_at("HEAD", path),
+            }
+        };
+        let parse = |path: &str, text: &str| -> Result<serde_json::Value> {
+            serde_json::from_str(text).map_err(|e| Error::Malformed {
+                path: path.to_string(),
+                reason: e.to_string(),
+            })
+        };
+        let at = prov.timestamp();
+        let note = format!("newer information on main ({by}): {}", prov.why);
+        let value_of = |writes: &Vec<FileWrite>, path: &str| -> Result<Option<String>> {
+            Ok(
+                current(writes, path)?.map(|t| match crate::fact::Fact::parse(&t, path) {
+                    Ok(f) if path.starts_with("facts/") => f.value,
+                    _ => t,
+                }),
+            )
+        };
+        let mut changed: Vec<FileWrite> = Vec::new();
+        // Held changes on these paths, and their questions.
+        let mut close_qs: Vec<String> = Vec::new();
+        for pid in self.record_ids("HEAD", proposal::DIR, "p")? {
+            let ppath = proposal::path_of(&pid);
+            let Some(text) = current(writes, &ppath)? else {
+                continue;
+            };
+            let mut p: Proposal =
+                serde_json::from_value(parse(&ppath, &text)?).map_err(|e| Error::Malformed {
+                    path: ppath.clone(),
+                    reason: e.to_string(),
+                })?;
+            let mut touched = false;
+            for c in p.changes.iter_mut() {
+                if c.status != ChangeStatus::Held || !paths.contains(&&c.path) {
+                    continue;
+                }
+                c.status = ChangeStatus::Fixed;
+                c.fixed_by = Some(by.to_string());
+                p.log.push(Decision {
+                    at: at.clone(),
+                    change: c.n,
+                    action: "fixed".into(),
+                    by: prov.author.clone(),
+                    human: prov.human.clone(),
+                    why: note.clone(),
+                    value: value_of(writes, &c.path)?,
+                    record: None,
+                    question: c.question.clone(),
+                });
+                close_qs.extend(c.question.clone());
+                touched = true;
+            }
+            if touched {
+                changed.push((ppath, Some(record::render(&p))));
+            }
+        }
+        // Open questions about these paths (their held changes, above).
+        for qid in self.record_ids("HEAD", DIR, PREFIX)? {
+            let qpath = path_of(&qid);
+            let Some(text) = current(writes, &qpath)? else {
+                continue;
+            };
+            let mut q: Question =
+                serde_json::from_value(parse(&qpath, &text)?).map_err(|e| Error::Malformed {
+                    path: qpath.clone(),
+                    reason: e.to_string(),
+                })?;
+            if !q.is_open() || !(paths.contains(&&q.path) || close_qs.contains(&q.id)) {
+                continue;
+            }
+            q.log.push(Answer {
+                at: at.clone(),
+                kind: "fixed".into(),
+                by: prov.author.clone(),
+                human: prov.human.clone(),
+                why: note.clone(),
+                change: Some(by.to_string()),
+            });
+            q.status = QuestionStatus::Closed;
+            q.closed = Some(Closed {
+                at: at.clone(),
+                by_change: by.to_string(),
+                action: "fixed".into(),
+                by: prov.author.clone(),
+                human: prov.human.clone(),
+                why: note.clone(),
+                value: value_of(writes, &q.path)?,
+            });
+            changed.push((qpath, Some(record::render(&q))));
+        }
+        for (path, text) in changed {
+            match writes.iter_mut().find(|(p, _)| *p == path) {
+                Some(w) => w.1 = text,
+                None => writes.push((path, text)),
+            }
+        }
+        Ok(())
+    }
+
     /// Open questions as one plain-text block for a shard's first context.
     pub fn questions_brief(&self, human: Option<&str>) -> Result<String> {
         let qs = self.questions_for(human)?;
@@ -267,6 +406,16 @@ impl Memory {
                 .collect();
             if !dk.is_empty() {
                 s += &format!("  already asked; didn't know: {}\n", dk.join(", "));
+            }
+            // A rejected answer's reason is often a check's result: the next
+            // person should hear it.
+            for a in q.log.iter().filter(|a| a.kind == "answer-rejected") {
+                s += &format!(
+                    "  an earlier answer ({}) was rejected by {}: {}\n",
+                    a.change.as_deref().unwrap_or("?"),
+                    a.by,
+                    a.why
+                );
             }
             s += &format!(
                 "  if they know:  mem {} {} <value> --why \"<what they said>\" --answers {}\n  if they don't: mem question dont-know {} --why \"<what they said>\"\n",

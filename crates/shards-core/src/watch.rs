@@ -351,10 +351,21 @@ pub struct PassReport {
     pub core: Vec<String>,
 }
 
+/// Her rule, said plainly in every `mem core context`: this whole system is
+/// checking.
+pub const CHECK_RULE: &str = "Check first. On every conflict, every answer to a question and \
+every held change: if there is a harmless check (read-only: ping it, read a config or label \
+file, ask a device what it reports; never anything that writes, moves or actuates), run it \
+before you decide or ask a person, and write the check and its result into your --why (or an \
+incident note). If the check disagrees with an answer, reject the answer with the check's \
+result; the question stays open, and the next person sees that result.";
+
 /// `mem core context`: everything a woken core needs, in one document.
 #[derive(Debug, Clone, Serialize)]
 pub struct CoreContext {
     pub format: u32,
+    /// The rule the core decides by; see [`CHECK_RULE`].
+    pub rule: &'static str,
     pub board: Board,
     /// Events not yet delivered to (or not yet handled by) a wake.
     pub events: Vec<Event>,
@@ -490,6 +501,7 @@ impl Memory {
         let events = main.watch_state()?.pending;
         Ok(CoreContext {
             format: BOARD_FORMAT,
+            rule: CHECK_RULE,
             board,
             ack_upto: events.iter().map(|e| e.id).max(),
             events,

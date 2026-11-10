@@ -95,6 +95,10 @@ pub enum ChangeStatus {
     /// Held, then settled by an accepted answer to its question; see
     /// `answered_by`.
     Answered,
+    /// Held, then newer information about the same fact reached main (an
+    /// accepted change, a settled conflict, a write on main); see
+    /// `fixed_by`.
+    Fixed,
 }
 
 impl ChangeStatus {
@@ -106,6 +110,7 @@ impl ChangeStatus {
             ChangeStatus::Rejected => "rejected",
             ChangeStatus::Conflict => "conflict",
             ChangeStatus::Answered => "answered",
+            ChangeStatus::Fixed => "fixed",
         }
     }
     /// Still to be decided.
@@ -156,6 +161,10 @@ pub struct Change {
     /// For an answered change: the accepted answer, `p4#1`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answered_by: Option<String>,
+    /// For a fixed change: what put newer information on main (`p4#1`, an
+    /// incident `i2`, or a write on main).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_by: Option<String>,
 }
 
 /// One of the shard's in-between versions of a path, before its dinit.
@@ -340,6 +349,7 @@ impl Memory {
                 answers,
                 question: None,
                 answered_by: None,
+                fixed_by: None,
             });
         }
         Ok(Proposal {
@@ -784,12 +794,23 @@ impl Memory {
             ));
             p.log.push(d);
         }
+        let fixes: Vec<(String, String)> = p
+            .changes
+            .iter()
+            .filter(|c| c.status == ChangeStatus::Accepted && outcome.iter().any(|o| o.0 == c.n))
+            .map(|c| (c.path.clone(), format!("{id}#{}", c.n)))
+            .collect();
         writes.push((p.path(), Some(p.render())));
         for o in others.into_values() {
             writes.push((o.path(), Some(o.render())));
         }
         for q in questions.values() {
             writes.push((q.path(), Some(record::render(q))));
+        }
+        // An accepted change is newer information about its fact: anything
+        // else held on it is fixed, and its open questions close.
+        for (path, by) in fixes {
+            self.close_superseded(&mut writes, &[path], &by, prov)?;
         }
         Ok(writes)
     }

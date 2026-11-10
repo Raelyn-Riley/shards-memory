@@ -250,6 +250,19 @@ What you do:
   and why. `mem incident show <id>` reads it. If you have something to add,
   `mem incident note <id> \"...\" --why \"...\"`. Nothing in an incident is
   ever removed.
+- **Check first.** This whole system is checking: what's in the memory,
+  and, where you can, the thing itself. On every conflict, every answer to
+  a question and every held change, if there is a harmless check
+  (read-only: ping it, read a config or label file, ask a device what it
+  reports; never anything that writes, moves or actuates), run it before
+  you decide or ask a person. Write the check and its result into your
+  `--why` (or the incident's note). If the check disagrees with an answer,
+  reject the answer with the check's result: the question stays open, and
+  the next person asked sees that result.
+- **Superseded is fixed.** When newer information about a fact reaches
+  main (a change you accept, a conflict a person settles, a write on main),
+  any held change on that fact becomes `fixed` and its open question closes
+  as `fixed`, linked to what fixed it. You don't need to close them by hand.
 - **Tell people.** Say who should talk to whom, and why, in a sentence.
 - **Write decisions to main.** What you decide and learn goes into the
   memory with `mem set`, `mem supersede` or `mem put`, with a clear `--why`.
@@ -583,10 +596,14 @@ impl Memory {
                     });
                 }
                 m.check_path_free(address)?;
-                Ok(vec![(
-                    address.home(),
-                    Some(fact_file(address, value, prov)),
-                )])
+                let mut w = vec![(address.home(), Some(fact_file(address, value, prov)))];
+                m.close_superseded(
+                    &mut w,
+                    &[address.home()],
+                    &main_write("set", address.as_str(), prov),
+                    prov,
+                )?;
+                Ok(w)
             },
         )
     }
@@ -607,10 +624,14 @@ impl Memory {
                 if current.value == value {
                     return Err(Error::Unchanged(address.to_string()));
                 }
-                Ok(vec![(
-                    address.home(),
-                    Some(fact_file(address, value, prov)),
-                )])
+                let mut w = vec![(address.home(), Some(fact_file(address, value, prov)))];
+                m.close_superseded(
+                    &mut w,
+                    &[address.home()],
+                    &main_write("supersede", address.as_str(), prov),
+                    prov,
+                )?;
+                Ok(w)
             },
         )
     }
@@ -651,11 +672,18 @@ impl Memory {
             std::slice::from_ref(&path),
             &prov,
             &[("Path", path.clone())],
-            |m, _| {
+            |m, prov| {
                 if m.read_file_at("HEAD", &path)?.as_deref() == Some(text) {
                     return Err(Error::Unchanged(path.clone()));
                 }
-                Ok(vec![(path.clone(), Some(text.to_string()))])
+                let mut w = vec![(path.clone(), Some(text.to_string()))];
+                m.close_superseded(
+                    &mut w,
+                    std::slice::from_ref(&path),
+                    &main_write("put", &path, prov),
+                    prov,
+                )?;
+                Ok(w)
             },
         )
     }
@@ -883,6 +911,15 @@ impl Memory {
             return Err(Error::Dirty(home));
         }
         Ok(())
+    }
+}
+
+/// What fixed a held change when a write on main did: `supersede
+/// devices/ctl/ip on main by core`.
+pub(crate) fn main_write(op: &str, target: &str, prov: &Provenance) -> String {
+    match &prov.human {
+        Some(h) => format!("{op} {target} on main by {} / {h}", prov.author),
+        None => format!("{op} {target} on main by {}", prov.author),
     }
 }
 
