@@ -278,7 +278,7 @@ fn start_status_and_stop() {
         }
         other => panic!("{other:?}"),
     }
-    assert_eq!(w.starts().last().unwrap(), &format!("args: --resume {id}"));
+    assert_resumed_with_init(w.starts().last().unwrap(), &id);
     w.mem.core_stop().unwrap();
 }
 
@@ -392,7 +392,7 @@ fn events_survive_a_dead_core() {
         "{:?}",
         r.wake
     );
-    assert_eq!(w.starts().last().unwrap(), &format!("args: --resume {id}"));
+    assert_resumed_with_init(w.starts().last().unwrap(), &id);
     assert_eq!(w.wakes(&id).len(), 1);
 }
 
@@ -422,7 +422,7 @@ fn watchdog_restores_the_pane_and_resumes_the_pinned_id() {
     assert_eq!(st.failures, 0);
     let starts = w.starts();
     assert_eq!(starts.len(), 2);
-    assert_eq!(starts[1], format!("args: --resume {id}"));
+    assert_resumed_with_init(&starts[1], &id);
     assert!(w.starts().iter().all(|l| !l.contains("--continue")));
     let log = fs::read_to_string(w.root().join(".shards/core/core.log")).unwrap();
     assert!(log.contains("watchdog: pane gone") && log.contains(&format!("resumed session {id}")));
@@ -543,7 +543,7 @@ fn a_failed_handoff_leaves_the_old_session() {
     let st = w.mem.core_status(Utc::now()).unwrap();
     assert!(st.command_alive);
     assert_eq!(st.session_id.as_deref(), Some(old.as_str()));
-    assert_eq!(w.starts().last().unwrap(), &format!("args: --resume {old}"));
+    assert_resumed_with_init(w.starts().last().unwrap(), &old);
     let log = fs::read_to_string(w.root().join(".shards/core/core.log")).unwrap();
     assert!(log.contains("rinit: FAILED"));
 }
@@ -889,7 +889,7 @@ fn a_core_killed_mid_wake_is_woken_once_more() {
         "{:?}",
         r.wake
     );
-    assert_eq!(w.starts().last().unwrap(), &format!("args: --resume {id}"));
+    assert_resumed_with_init(w.starts().last().unwrap(), &id);
     assert_eq!(
         w.mem.watch_pass(Utc::now()).unwrap().wake,
         WakeOutcome::AwaitingAck { events: 1 }
@@ -901,4 +901,13 @@ fn a_core_killed_mid_wake_is_woken_once_more() {
         vec!["[WAKE] 1 event, up to #1: run mem core context"]
     );
     assert_eq!(w.mem.core_ack(None, Utc::now()).unwrap(), (1, 0));
+}
+
+/// A resume names the pinned id and passes the core's init again, as the
+/// system prompt (brief 14).
+fn assert_resumed_with_init(line: &str, id: &str) {
+    assert!(
+        line.starts_with(&format!("args: --resume {id} --append-system-prompt <")),
+        "{line}"
+    );
 }
