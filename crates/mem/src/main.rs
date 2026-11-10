@@ -62,6 +62,9 @@ enum Cmd {
         value: String,
         #[arg(long)]
         why: Option<String>,
+        /// The open question this answers (e.g. ask2), from a shard.
+        #[arg(long, value_name = "QUESTION")]
+        answers: Option<String>,
         #[command(flatten)]
         who: Who,
     },
@@ -72,10 +75,13 @@ enum Cmd {
         value: String,
         #[arg(long)]
         why: Option<String>,
+        /// The open question this answers (e.g. ask2), from a shard.
+        #[arg(long, value_name = "QUESTION")]
+        answers: Option<String>,
         #[command(flatten)]
         who: Who,
     },
-    /// Every version of a fact, newest first.
+    /// Every version of a fact, newest first, and any shard's drafts of it.
     History { address: String },
     /// Replace every {{fact:<address>}} pointer with the current value.
     Resolve {
@@ -103,6 +109,9 @@ enum Cmd {
         /// notes/<file>.md path is a shared note.
         #[arg(long = "for", value_name = "PERSON")]
         for_person: Option<String>,
+        /// The open question this answers (e.g. ask2), from a shard.
+        #[arg(long, value_name = "QUESTION")]
+        answers: Option<String>,
         #[command(flatten)]
         who: Who,
     },
@@ -117,13 +126,15 @@ enum Cmd {
         #[arg(long)]
         all_or_nothing: bool,
     },
-    /// Settle a conflict recorded by dinit.
+    /// Settle a conflict: a person's pick is final and goes straight to main.
+    /// Needs the person's name (--human) and --why; writes an incident.
     ResolveConflict {
         /// A fact address, or a repo path ending in .md (people/, notes/).
         target: String,
         /// `shard`, `main`, or a literal new value.
         #[arg(long)]
         take: String,
+        /// Why that side is right (required; kept in the incident).
         #[arg(long)]
         why: Option<String>,
         /// Which shard's conflict, if several shards conflict on it.
@@ -139,6 +150,12 @@ enum Cmd {
     /// and accept, reject or hold each change.
     #[command(subcommand)]
     Proposal(ProposalCmd),
+    /// Settled conflicts: list, show, and add a note (nothing is ever removed).
+    #[command(subcommand)]
+    Incident(IncidentCmd),
+    /// Open questions from held changes, for the next person who can answer.
+    #[command(subcommand)]
+    Question(QuestionCmd),
     /// What every open shard is doing, read from git and its transcript.
     Board {
         /// Machine-readable output (format documented in the README).
@@ -212,6 +229,13 @@ enum ShardCmd {
         #[arg(long)]
         json: bool,
     },
+    /// What a shard should know at the start of a session: who it is with,
+    /// and the open questions this person may answer.
+    Context {
+        /// The shard (default: this pane's shard).
+        #[arg(long, env = "SHARDS_SHARD")]
+        id: Option<String>,
+    },
     /// Set a shard's one-line status ("working on X").
     Status {
         #[arg(long)]
@@ -281,10 +305,66 @@ enum ProposalCmd {
         #[command(flatten)]
         d: Decide,
     },
-    /// Hold for a human: main stays as it is until a human decides.
+    /// Hold for a human: main stays as it is until a human decides. Needs
+    /// --ask: the question for the next person who can answer it.
     Hold {
         #[command(flatten)]
         d: Decide,
+        /// What to ask the next person, e.g. "Mike mentioned he replaced the
+        /// spindle, but only in passing. Would you confirm it?"
+        #[arg(long)]
+        ask: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum IncidentCmd {
+    /// Every incident, newest first.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// One incident: both sides, who settled it and why, and any notes.
+    Show {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add a note to an incident, with a reason (the core's, usually).
+    Note {
+        id: String,
+        /// The note; `-` reads stdin.
+        text: String,
+        #[arg(long)]
+        why: Option<String>,
+        #[command(flatten)]
+        who: Who,
+    },
+}
+
+#[derive(Subcommand)]
+enum QuestionCmd {
+    /// Open questions (--all: closed ones too).
+    List {
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// One question: what to ask, who said it, and everything since.
+    Show {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// The person asked doesn't know: logged, and the question stays open.
+    DontKnow {
+        id: String,
+        /// What they said.
+        #[arg(long)]
+        why: Option<String>,
+        #[command(flatten)]
+        who: Who,
     },
 }
 
@@ -610,6 +690,201 @@ fn print_board(out: &mut impl Write, b: &Board) -> io::Result<()> {
             )?;
         }
     }
+    if !b.questions.is_empty() {
+        writeln!(out, "\nopen questions (mem question show <id>):")?;
+        for q in &b.questions {
+            writeln!(
+                out,
+                "  {}  {}  ({}, said by {}{})  {}",
+                q.id,
+                q.target,
+                q.change,
+                q.said_by,
+                if q.dont_know > 0 {
+                    format!(", {} didn't know", q.dont_know)
+                } else {
+                    String::new()
+                },
+                q.ask
+            )?;
+        }
+    }
+    if !b.incidents.is_empty() {
+        writeln!(out, "\nrecent incidents (mem incident show <id>):")?;
+        for i in &b.incidents {
+            writeln!(
+                out,
+                "  {}  {}  {}{}",
+                i.id,
+                i.settled_at,
+                i.summary,
+                if i.notes > 0 {
+                    format!("  ({} note(s))", i.notes)
+                } else {
+                    String::new()
+                }
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn print_drafts(out: &mut impl Write, p: &Proposal, c: &shards_core::Change) -> io::Result<()> {
+    writeln!(
+        out,
+        "  drafts: shard {}'s earlier versions in {}#{}, oldest first (never on main):",
+        p.shard, p.id, c.n
+    )?;
+    for d in &c.drafts {
+        writeln!(
+            out,
+            "    {}  {}  draft: {}\n      why: {}",
+            d.updated,
+            short(&d.commit),
+            d.value
+                .as_deref()
+                .unwrap_or("(removed)")
+                .replace('\n', " ⏎ "),
+            d.why
+        )?;
+    }
+    Ok(())
+}
+
+fn print_incident(out: &mut impl Write, i: &shards_core::Incident) -> io::Result<()> {
+    writeln!(out, "{}  {}", i.id, i.summary)?;
+    writeln!(out, "  target:   {}  [{}]", i.target, i.path)?;
+    writeln!(
+        out,
+        "  conflict: {} (recorded {})",
+        i.conflict_record, i.conflict_recorded
+    )?;
+    writeln!(out, "  shards:   {}", i.shards.join(", "))?;
+    writeln!(out, "  humans:   {}", i.humans.join(", "))?;
+    for (label, s) in [
+        ("main", &i.main),
+        (&format!("shard {}", i.shard)[..], &i.shard_side),
+    ] {
+        writeln!(out, "\n  {label}:")?;
+        writeln!(out, "    value:   {}", s.value.replace('\n', " ⏎ "))?;
+        writeln!(
+            out,
+            "    by:      {}{}  ({})",
+            s.author,
+            s.human
+                .as_deref()
+                .map(|h| format!(" / {h}"))
+                .unwrap_or_default(),
+            s.updated
+        )?;
+        writeln!(out, "    why:     {}", s.why)?;
+    }
+    let st = &i.settled;
+    writeln!(
+        out,
+        "\n  settled:  {} took {} ({} was correct) at {}",
+        st.human, st.take, st.correct, st.at
+    )?;
+    writeln!(out, "    value:   {}", st.value.replace('\n', " ⏎ "))?;
+    writeln!(out, "    why:     {}", st.why)?;
+    if !i.notes.is_empty() {
+        writeln!(out, "\n  notes:")?;
+        for n in &i.notes {
+            writeln!(
+                out,
+                "    {}  {}{}: {}\n      why: {}",
+                n.at,
+                n.by,
+                n.human
+                    .as_deref()
+                    .map(|h| format!(" / {h}"))
+                    .unwrap_or_default(),
+                n.note.replace('\n', " ⏎ "),
+                n.why
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn print_question(out: &mut impl Write, mem: &Memory, q: &shards_core::Question) -> io::Result<()> {
+    writeln!(out, "{}  [{}]  about {}", q.id, q.status.as_str(), q.target)?;
+    writeln!(out, "  ask:       {}", q.ask)?;
+    writeln!(
+        out,
+        "  held:      {} by {}: {}",
+        q.held_change(),
+        q.held_by,
+        q.held_why
+    )?;
+    writeln!(
+        out,
+        "  said by:   {} (shard {}): {}",
+        q.said_by_human.as_deref().unwrap_or("-"),
+        q.said_by_shard,
+        q.value
+            .as_deref()
+            .unwrap_or("(removal)")
+            .replace('\n', " ⏎ ")
+    )?;
+    writeln!(out, "  their why: {}", q.said_why)?;
+    // Answers still waiting for the core.
+    if let Ok(ps) = mem.proposals() {
+        for p in ps {
+            for c in p.changes.iter().filter(|c| c.status.is_open()) {
+                if c.answers.as_deref() == Some(q.id.as_str()) {
+                    writeln!(
+                        out,
+                        "  answer waiting for the core: {}#{} from {} ({}): {}",
+                        p.id,
+                        c.n,
+                        p.shard,
+                        p.human.as_deref().unwrap_or("-"),
+                        c.value
+                            .as_deref()
+                            .unwrap_or("(removal)")
+                            .replace('\n', " ⏎ ")
+                    )?;
+                }
+            }
+        }
+    }
+    if !q.log.is_empty() {
+        writeln!(out, "\n  since:")?;
+        for a in &q.log {
+            writeln!(
+                out,
+                "    {}  {}  {}{}{}: {}",
+                a.at,
+                a.kind,
+                a.by,
+                a.human
+                    .as_deref()
+                    .map(|h| format!(" / {h}"))
+                    .unwrap_or_default(),
+                a.change
+                    .as_deref()
+                    .map(|c| format!(" ({c})"))
+                    .unwrap_or_default(),
+                a.why
+            )?;
+        }
+    }
+    if let Some(c) = &q.closed {
+        writeln!(
+            out,
+            "\n  closed {} by {} ({}), {}{}: {}",
+            c.at,
+            c.by_change,
+            c.action,
+            c.by,
+            c.human
+                .as_deref()
+                .map(|h| format!(" / {h}"))
+                .unwrap_or_default(),
+            c.why
+        )?;
+    }
     Ok(())
 }
 
@@ -655,6 +930,27 @@ fn print_proposal(out: &mut impl Write, p: &Proposal) -> io::Result<()> {
         if let Some(r) = &c.conflict_record {
             writeln!(out, "      conflict: {r} (mem resolve-conflict)")?;
         }
+        if let Some(q) = &c.answers {
+            writeln!(out, "      answers:  {q} (mem question show {q})")?;
+        }
+        if let Some(q) = &c.question {
+            writeln!(out, "      question: {q} (mem question show {q})")?;
+        }
+        if let Some(a) = &c.answered_by {
+            writeln!(out, "      answered by: {a}")?;
+        }
+        for (i, d) in c.drafts.iter().enumerate() {
+            writeln!(
+                out,
+                "      draft {}: {}  (why: {})",
+                i + 1,
+                d.value
+                    .as_deref()
+                    .unwrap_or("(removed)")
+                    .replace('\n', " ⏎ "),
+                d.why
+            )?;
+        }
     }
     if !p.log.is_empty() {
         writeln!(out, "\n  decisions:")?;
@@ -676,6 +972,9 @@ fn print_proposal(out: &mut impl Write, p: &Proposal) -> io::Result<()> {
                     .map(|v| format!("  (value: {})", v.replace('\n', " ⏎ ")))
                     .unwrap_or_default()
             )?;
+            if let Some(q) = &d.question {
+                writeln!(out, "      question: {q}")?;
+            }
         }
     }
     let open: Vec<String> = p
@@ -958,29 +1257,44 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             address,
             value,
             why,
+            answers,
             who,
         } => {
             let mem = Memory::open(&cli.memory)?;
             let a = Address::parse(&address)?;
-            let commit = mem.set(&a, &read_value(value)?, &prov(who, why))?;
+            let mut p = prov(who, why);
+            p.answers = given(answers);
+            let commit = mem.set(&a, &read_value(value)?, &p)?;
             writeln!(out, "set {a} at {} ({})", a.home(), short(&commit))?;
         }
         Cmd::Supersede {
             address,
             value,
             why,
+            answers,
             who,
         } => {
             let mem = Memory::open(&cli.memory)?;
             let a = Address::parse(&address)?;
-            let commit = mem.supersede(&a, &read_value(value)?, &prov(who, why))?;
+            let mut p = prov(who, why);
+            p.answers = given(answers);
+            let commit = mem.supersede(&a, &read_value(value)?, &p)?;
             writeln!(out, "superseded {a} at {} ({})", a.home(), short(&commit))?;
         }
         Cmd::History { address } => {
             let mem = Memory::open(&cli.memory)?;
             let a = Address::parse(&address)?;
             writeln!(out, "{a}  [{}]", a.home())?;
-            for e in mem.history(&a)? {
+            let drafts = mem.drafts_for(a.as_str())?;
+            let entries = match mem.history(&a) {
+                Err(shards_core::Error::UnknownAddress(_)) if !drafts.is_empty() => {
+                    writeln!(out, "\n(not on main)")?;
+                    Vec::new()
+                }
+                r => r?,
+            };
+            let mut shown = std::collections::BTreeSet::new();
+            for e in entries {
                 writeln!(out)?;
                 writeln!(out, "{}  {}", e.updated, short(&e.commit))?;
                 writeln!(out, "  author: {}", e.author)?;
@@ -994,6 +1308,33 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     )?;
                 }
                 writeln!(out, "  value:  {}", e.value.replace('\n', "\n          "))?;
+                if let Some(r) = &e.review {
+                    if let Some((p, c)) = drafts
+                        .iter()
+                        .find(|(p, c)| format!("{}#{}", p.id, c.n) == r.proposal)
+                    {
+                        print_drafts(&mut out, p, c)?;
+                        shown.insert(r.proposal.clone());
+                    }
+                }
+            }
+            for (p, c) in &drafts {
+                if !shown.contains(&format!("{}#{}", p.id, c.n)) {
+                    writeln!(out)?;
+                    writeln!(
+                        out,
+                        "{}#{} [{}], proposed by shard {}: {}",
+                        p.id,
+                        c.n,
+                        c.status.as_str(),
+                        p.shard,
+                        c.value
+                            .as_deref()
+                            .unwrap_or("(removal)")
+                            .replace('\n', " ⏎ ")
+                    )?;
+                    print_drafts(&mut out, p, c)?;
+                }
             }
         }
         Cmd::Resolve { file, annotate } => {
@@ -1022,13 +1363,15 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             file,
             why,
             for_person,
+            answers,
             who,
         } => {
             let mem = Memory::open(&cli.memory)?;
             let text = read_input(file)?;
             let person = given(for_person);
-            let (path, commit) =
-                mem.put_note_as(person.as_deref(), &path, &text, &prov(who, why))?;
+            let mut p = prov(who, why);
+            p.answers = given(answers);
+            let (path, commit) = mem.put_note_as(person.as_deref(), &path, &text, &p)?;
             writeln!(out, "wrote {path} ({})", short(&commit))?;
         }
         Cmd::Notes(NotesCmd::Find {
@@ -1211,13 +1554,19 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             who,
         } => {
             let mem = Memory::open(&cli.memory)?;
-            let commit = mem.resolve_conflict(
+            let r = mem.resolve_conflict(
                 &target,
                 &Take::parse(&take),
                 shard.as_deref(),
                 &prov(who, why),
             )?;
-            writeln!(out, "resolved {target} (took {take}) ({})", short(&commit))?;
+            let i = mem.incident(&r.incident)?;
+            writeln!(
+                out,
+                "resolved {target} (took {take}) ({})",
+                short(&r.commit)
+            )?;
+            writeln!(out, "incident {}: {}", i.id, i.summary)?;
         }
         Cmd::Soul(SoulCmd::Approve {
             shard,
@@ -1280,7 +1629,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     (d, Verdict::Accept(v))
                 }
                 ProposalCmd::Reject { d } => (d, Verdict::Reject),
-                ProposalCmd::Hold { d } => (d, Verdict::Hold),
+                ProposalCmd::Hold { d, ask } => (d, Verdict::Hold(ask.unwrap_or_default())),
             };
             // A shard's pane sets SHARDS_SHARD: its agent proposes, never decides.
             if let Some(s) = given(std::env::var("SHARDS_SHARD").ok()) {
@@ -1308,6 +1657,101 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 )?;
             }
             writeln!(out, "logged on main ({})", short(&r.commit))?;
+        }
+        Cmd::Incident(cmd) => {
+            let mem = Memory::open(&cli.memory)?;
+            match cmd {
+                IncidentCmd::List { json } => {
+                    let mut list = mem.incidents()?;
+                    list.reverse();
+                    if json {
+                        writeln!(out, "{}", serde_json::to_string_pretty(&list)?)?;
+                    } else if list.is_empty() {
+                        writeln!(out, "no incidents")?;
+                    }
+                    for i in list.iter().filter(|_| !json) {
+                        writeln!(out, "{}  {}  {}", i.id, i.settled.at, i.summary)?;
+                    }
+                }
+                IncidentCmd::Show { id, json } => {
+                    let i = mem.incident(&id)?;
+                    if json {
+                        writeln!(out, "{}", serde_json::to_string_pretty(&i)?)?;
+                    } else {
+                        print_incident(&mut out, &i)?;
+                    }
+                }
+                IncidentCmd::Note { id, text, why, who } => {
+                    let text = read_value(text)?;
+                    let commit = mem.incident_note(&id, &text, &prov(who, why))?;
+                    writeln!(out, "noted on {id} ({})", short(&commit))?;
+                }
+            }
+        }
+        Cmd::Question(cmd) => {
+            let mem = Memory::open(&cli.memory)?;
+            match cmd {
+                QuestionCmd::List { all, json } => {
+                    let list: Vec<_> = mem
+                        .questions()?
+                        .into_iter()
+                        .filter(|q| all || q.is_open())
+                        .collect();
+                    if json {
+                        writeln!(out, "{}", serde_json::to_string_pretty(&list)?)?;
+                    } else if list.is_empty() {
+                        writeln!(out, "no {}questions", if all { "" } else { "open " })?;
+                    }
+                    for q in list.iter().filter(|_| !json) {
+                        writeln!(
+                            out,
+                            "{}  [{}]  {}  ({}, said by {})  {}",
+                            q.id,
+                            q.status.as_str(),
+                            q.target,
+                            q.held_change(),
+                            q.said_by_human.as_deref().unwrap_or(&q.said_by_shard),
+                            q.ask
+                        )?;
+                    }
+                }
+                QuestionCmd::Show { id, json } => {
+                    let q = mem.question(&id)?;
+                    if json {
+                        writeln!(out, "{}", serde_json::to_string_pretty(&q)?)?;
+                    } else {
+                        print_question(&mut out, &mem, &q)?;
+                    }
+                }
+                QuestionCmd::DontKnow { id, why, who } => {
+                    let commit = mem.question_dont_know(&id, &prov(who, why))?;
+                    writeln!(
+                        out,
+                        "logged on {id}: they don't know; it stays open for the next person ({})",
+                        short(&commit)
+                    )?;
+                }
+            }
+        }
+        Cmd::Shard(ShardCmd::Context { id }) => {
+            let mem = Memory::open(&cli.memory)?;
+            let id = given(id).or_else(|| match mem.context() {
+                shards_core::Context::Shard(s) => Some(s.clone()),
+                _ => None,
+            });
+            let human = match &id {
+                Some(id) => mem.shard_meta(id).ok().and_then(|m| m.human),
+                None => None,
+            };
+            match &id {
+                Some(id) => writeln!(
+                    out,
+                    "You are shard {id}, with {}.\n",
+                    human.as_deref().unwrap_or("no one named yet")
+                )?,
+                None => writeln!(out, "Not in a shard.\n")?,
+            }
+            write!(out, "{}", mem.questions_brief(human.as_deref())?)?;
         }
         Cmd::Board { json } => {
             let mem = Memory::open(&cli.memory)?;
