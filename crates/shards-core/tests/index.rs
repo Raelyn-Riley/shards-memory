@@ -187,37 +187,3 @@ fn from_a_shard_the_index_marks_its_pending_facts_and_the_core_keeps_the_descrip
     );
     assert_eq!(f.value, "10.77.0.22");
 }
-
-#[test]
-fn everything_the_index_lists_from_a_shard_can_be_read_there() {
-    let (_t, mem) = fresh();
-    let meta = mem.shard_open("s1", Some("Nell")).unwrap();
-    let s1 = Memory::open_with_env(&meta.worktree, env()).unwrap();
-    // A fact reaches main after the shard opened.
-    mem.set_described(
-        &addr("equipment/saws/band-2/blade"),
-        "14 TPI bimetal",
-        Some("Blade fitted on band saw 2"),
-        &core("fitted it"),
-    )
-    .unwrap();
-    assert!(s1
-        .index(None)
-        .unwrap()
-        .iter()
-        .any(|e| e.address == "equipment/saws/band-2/blade"));
-    // The shard's branch never had it; `get` is the branch, `get_listed`
-    // reads it from main and says so.
-    assert!(s1.get(&addr("equipment/saws/band-2/blade")).is_err());
-    let (f, from_main) = s1
-        .get_listed(&addr("equipment/saws/band-2/blade"))
-        .unwrap();
-    assert_eq!((f.value.as_str(), from_main), ("14 TPI bimetal", true));
-    // What the shard has is read as the shard has it.
-    s1.supersede(&addr("shop/hours"), "6-14", &shardp("winter"))
-        .unwrap();
-    let (f, from_main) = s1.get_listed(&addr("shop/hours")).unwrap();
-    assert_eq!((f.value.as_str(), from_main), ("6-14", false));
-    // Unknown stays unknown.
-    assert!(s1.get_listed(&addr("nothing/here")).is_err());
-}

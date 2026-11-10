@@ -14,9 +14,7 @@
 //! From main it lists main. From a shard's worktree it lists main as it is
 //! now (so facts accepted since the shard opened show up), plus the shard's
 //! own facts that aren't on main yet, marked `pending`: `new`, `changed` or
-//! `removed` on this shard, waiting for its dinit and the core. A fact that
-//! reached main after the shard opened is readable from the shard too:
-//! `mem get` reads it from main ([`Memory::get_listed`]).
+//! `removed` on this shard, waiting for its dinit and the core.
 
 use serde::Serialize;
 
@@ -45,27 +43,6 @@ fn in_section(address: &str, section: &str) -> bool {
 }
 
 impl Memory {
-    /// `mem get` for a person: from a shard, a fact that reached main after
-    /// the shard opened (so its branch has never had it) is read from main,
-    /// so everything `mem index` lists can be read. The bool says it came
-    /// from main. A fact the shard has, or removed, is read as the shard
-    /// has it, as always.
-    pub fn get_listed(&self, address: &Address) -> Result<(crate::memory::Fact, bool)> {
-        match self.get(address) {
-            Err(crate::error::Error::UnknownAddress(_))
-                if matches!(self.context, Context::Shard(_)) =>
-            {
-                let base = self.git.run(&["merge-base", "main", "HEAD"])?;
-                if self.read_file_at(base.trim(), &address.home())?.is_some() {
-                    // The shard removed it.
-                    return Err(crate::error::Error::UnknownAddress(address.to_string()));
-                }
-                Ok((self.main()?.get(address)?, true))
-            }
-            r => Ok((r?, false)),
-        }
-    }
-
     fn index_at(&self, rev: &str, section: &str) -> Result<Vec<(String, Option<String>)>> {
         let out = self
             .git
