@@ -855,7 +855,15 @@ impl Memory {
                         m.require_admin(prov.human.as_deref(), "changing the soul on main")?;
                     }
                     let contents = match Address::from_home(&path) {
-                        Some(a) => fact_file(&a, v, prov),
+                        Some(a) => {
+                            // The fact keeps main's description.
+                            let d = m
+                                .read_file_at("HEAD", &path)?
+                                .and_then(|t| crate::fact::Fact::parse(&t, &path).ok())
+                                .and_then(|f| f.front.description)
+                                .filter(|d| !d.to_lowercase().contains(&v.trim().to_lowercase()));
+                            fact_file(&a, v, d.as_deref(), prov)
+                        }
                         None => v.clone(),
                     };
                     writes.insert(0, (path.clone(), Some(contents)));

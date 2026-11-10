@@ -6,6 +6,7 @@
 //! ```text
 //! ---
 //! address: "devices/rotoforge-ctl/ip"
+//! description: "the rotoforge controller's address on the shop network"
 //! updated: "2026-11-03T14:00:00Z"
 //! author: "shard-7f3a"
 //! human: "Raelyn"
@@ -16,7 +17,8 @@
 //!
 //! Every front-matter value is written as a double-quoted string using JSON
 //! escaping, which is also valid YAML. Keys are written in the fixed order
-//! above; `human` is omitted when there is none. A fact accepted from a
+//! above; `human` is omitted when there is none, and so is `description`
+//! (one line saying what the fact is, never its value; `mem index` lists it). A fact accepted from a
 //! shard's proposal adds `proposal` (`p3#2`), `reviewed_by` and
 //! `review_why` after `why`: `author`, `human` and `why` stay the shard's.
 //! The body is the value followed by exactly one newline.
@@ -26,6 +28,8 @@ use crate::error::{Error, Result};
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FrontMatter {
     pub address: String,
+    /// What the fact is, in one line, for `mem index`. Never the value.
+    pub description: Option<String>,
     /// RFC 3339, UTC, written by the tool.
     pub updated: String,
     pub author: String,
@@ -52,11 +56,14 @@ fn quote(s: &str) -> String {
 impl Fact {
     pub fn render(&self) -> String {
         let f = &self.front;
-        let mut pairs = vec![
-            ("address", f.address.as_str()),
+        let mut pairs = vec![("address", f.address.as_str())];
+        if let Some(d) = &f.description {
+            pairs.push(("description", d.as_str()));
+        }
+        pairs.extend([
             ("updated", f.updated.as_str()),
             ("author", f.author.as_str()),
-        ];
+        ]);
         if let Some(h) = &f.human {
             pairs.push(("human", h.as_str()));
         }
@@ -90,6 +97,7 @@ impl Fact {
         Ok(Fact {
             front: FrontMatter {
                 address: get("address").ok_or_else(|| bad("missing `address`"))?,
+                description: get("description").filter(|v| !v.trim().is_empty()),
                 updated: get("updated").ok_or_else(|| bad("missing `updated`"))?,
                 author: get("author").ok_or_else(|| bad("missing `author`"))?,
                 human: get("human").filter(|v| !v.is_empty()),
@@ -179,6 +187,7 @@ mod tests {
             sample(None, "trailing newline\n"),
             Fact {
                 front: FrontMatter {
+                    description: Some("the forge controller's address".into()),
                     proposal: Some("p3#2".into()),
                     reviewed_by: Some("core".into()),
                     review_why: Some("matches the label".into()),

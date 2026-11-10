@@ -62,6 +62,9 @@ enum Cmd {
         value: String,
         #[arg(long)]
         why: Option<String>,
+        /// One line saying what the fact is (never its value), for `mem index`.
+        #[arg(long, visible_alias = "desc")]
+        description: Option<String>,
         /// The open question this answers (e.g. ask2), from a shard.
         #[arg(long, value_name = "QUESTION")]
         answers: Option<String>,
@@ -75,6 +78,9 @@ enum Cmd {
         value: String,
         #[arg(long)]
         why: Option<String>,
+        /// A new description (else the fact keeps its own).
+        #[arg(long, visible_alias = "desc")]
+        description: Option<String>,
         /// The open question this answers (e.g. ask2), from a shard.
         #[arg(long, value_name = "QUESTION")]
         answers: Option<String>,
@@ -83,6 +89,23 @@ enum Cmd {
     },
     /// Every version of a fact, newest first, and any shard's drafts of it.
     History { address: String },
+    /// Every fact's address with a short description, and no values. From a
+    /// shard, its own facts not on main yet are marked pending.
+    Index {
+        /// Only this section, e.g. `devices` or `devices/ctl`.
+        section: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change a fact's description (on main: the core's to edit).
+    Describe {
+        address: String,
+        description: String,
+        #[arg(long)]
+        why: Option<String>,
+        #[command(flatten)]
+        who: Who,
+    },
     /// Replace every {{fact:<address>}} pointer with the current value.
     Resolve {
         /// File to read; `-` or omitted reads stdin.
@@ -1260,6 +1283,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             address,
             value,
             why,
+            description,
             answers,
             who,
         } => {
@@ -1267,13 +1291,20 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let a = Address::parse(&address)?;
             let mut p = prov(who, why);
             p.answers = given(answers);
-            let commit = mem.set(&a, &read_value(value)?, &p)?;
+            let commit = mem.set_described(&a, &read_value(value)?, description.as_deref(), &p)?;
             writeln!(out, "set {a} at {} ({})", a.home(), short(&commit))?;
+            if given(description).is_none() {
+                eprintln!(
+                    "mem: note: no --description, so `mem index` lists {a} without one; \
+                     next time say what the fact is (not its value) with --description \"...\""
+                );
+            }
         }
         Cmd::Supersede {
             address,
             value,
             why,
+            description,
             answers,
             who,
         } => {
@@ -1281,8 +1312,55 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let a = Address::parse(&address)?;
             let mut p = prov(who, why);
             p.answers = given(answers);
-            let commit = mem.supersede(&a, &read_value(value)?, &p)?;
+            let commit =
+                mem.supersede_described(&a, &read_value(value)?, description.as_deref(), &p)?;
             writeln!(out, "superseded {a} at {} ({})", a.home(), short(&commit))?;
+        }
+        Cmd::Index { section, json } => {
+            let mem = Memory::open(&cli.memory)?;
+            let entries = mem.index(section.as_deref())?;
+            if json {
+                writeln!(out, "{}", serde_json::to_string_pretty(&entries)?)?;
+            } else if entries.is_empty() {
+                writeln!(
+                    out,
+                    "no facts{}",
+                    section.map(|s| format!(" under {s}")).unwrap_or_default()
+                )?;
+            } else {
+                let w = entries.iter().map(|e| e.address.len()).max().unwrap_or(0);
+                for e in &entries {
+                    write!(
+                        out,
+                        "{:<w$}  {}",
+                        e.address,
+                        e.description.as_deref().unwrap_or("(no description)")
+                    )?;
+                    match e.pending {
+                        Some(p) => {
+                            writeln!(out, "  [pending: {p} on this shard, not on main yet]")?
+                        }
+                        None => writeln!(out)?,
+                    }
+                }
+                writeln!(
+                    out,
+                    "\n{} fact{}. Values aren't listed: read one with mem get <address>.",
+                    entries.len(),
+                    if entries.len() == 1 { "" } else { "s" }
+                )?;
+            }
+        }
+        Cmd::Describe {
+            address,
+            description,
+            why,
+            who,
+        } => {
+            let mem = Memory::open(&cli.memory)?;
+            let a = Address::parse(&address)?;
+            let commit = mem.describe(&a, &description, &prov(who, why))?;
+            writeln!(out, "described {a} ({})", short(&commit))?;
         }
         Cmd::History { address } => {
             let mem = Memory::open(&cli.memory)?;

@@ -161,6 +161,10 @@ pub struct Change {
     /// For an answered change: the accepted answer, `p4#1`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answered_by: Option<String>,
+    /// The fact's description on the shard, when it gave one (for
+    /// `mem index`; never the value).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// For a fixed change: what put newer information on main (`p4#1`, an
     /// incident `i2`, or a write on main).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -328,6 +332,17 @@ impl Memory {
             };
             let side = self.side(tip, p)?;
             let (drafts, answers) = self.drafts_of(base, tip, p)?;
+            let describe = |rev: &str| -> Result<Option<String>> {
+                Ok(self
+                    .read_file_at(rev, p)?
+                    .and_then(|t| FactFile::parse(&t, p).ok())
+                    .and_then(|f| f.front.description))
+            };
+            // Only a description the shard gave or changed.
+            let description = match describe(tip)? {
+                Some(d) if Some(&d) != describe(main_head)?.as_ref() => Some(d),
+                _ => None,
+            };
             changes.push(Change {
                 n: i + 1,
                 op,
@@ -349,6 +364,7 @@ impl Memory {
                 answers,
                 question: None,
                 answered_by: None,
+                description,
                 fixed_by: None,
             });
         }
@@ -663,12 +679,32 @@ impl Memory {
                         d.value = value;
                         d.record = Some(record);
                     } else {
+                        // The shard's description if it gave one, else
+                        // main's; never one that carries the value.
+                        let description = match (&value, &c.description) {
+                            (Some(v), Some(d)) => {
+                                crate::memory::check_description(Some(d), v).ok().flatten()
+                            }
+                            _ => None,
+                        }
+                        .or_else(|| {
+                            current
+                                .as_deref()
+                                .and_then(|t| FactFile::parse(t, &c.path).ok())
+                                .and_then(|f| f.front.description)
+                                .filter(|d| {
+                                    value.as_deref().is_none_or(|v| {
+                                        crate::memory::check_description(Some(d), v).is_ok()
+                                    })
+                                })
+                        });
                         let contents = match (&value, Address::from_home(&c.path)) {
                             (None, _) => None,
                             (Some(v), Some(a)) => Some(
                                 FactFile {
                                     front: FrontMatter {
                                         address: a.to_string(),
+                                        description,
                                         updated: at.clone(),
                                         author: c.author.clone(),
                                         human: p.human.clone().filter(|h| !h.is_empty()),

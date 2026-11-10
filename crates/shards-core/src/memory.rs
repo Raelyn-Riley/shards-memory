@@ -579,7 +579,21 @@ impl Memory {
     /// Refuses only an exact existing address. Near-duplicates (the same name
     /// elsewhere) are left to a later drift checker, which flags for a human.
     pub fn set(&self, address: &Address, value: &str, prov: &Provenance) -> Result<String> {
+        self.set_described(address, value, None, prov)
+    }
+
+    /// [`Memory::set`] with a one-line description of what the fact is
+    /// (for `mem index`; never the value).
+    pub fn set_described(
+        &self,
+        address: &Address,
+        value: &str,
+        description: Option<&str>,
+        prov: &Provenance,
+    ) -> Result<String> {
         check_value(value)?;
+        let description = check_description(description, value)?;
+        let description = description.as_deref();
         let prov = self.effective(prov, true)?;
         self.check_answers(&prov, address.as_str())?;
         self.locked_commit(
@@ -596,7 +610,10 @@ impl Memory {
                     });
                 }
                 m.check_path_free(address)?;
-                let mut w = vec![(address.home(), Some(fact_file(address, value, prov)))];
+                let mut w = vec![(
+                    address.home(),
+                    Some(fact_file(address, value, description, prov)),
+                )];
                 m.close_superseded(
                     &mut w,
                     &[address.home()],
@@ -610,7 +627,20 @@ impl Memory {
 
     /// Replace the value of an existing fact. Returns the commit id.
     pub fn supersede(&self, address: &Address, value: &str, prov: &Provenance) -> Result<String> {
+        self.supersede_described(address, value, None, prov)
+    }
+
+    /// [`Memory::supersede`]; the fact keeps its description unless a new
+    /// one is given.
+    pub fn supersede_described(
+        &self,
+        address: &Address,
+        value: &str,
+        description: Option<&str>,
+        prov: &Provenance,
+    ) -> Result<String> {
         check_value(value)?;
+        let given = check_description(description, value)?;
         let prov = self.effective(prov, true)?;
         self.check_answers(&prov, address.as_str())?;
         self.locked_commit(
@@ -624,7 +654,12 @@ impl Memory {
                 if current.value == value {
                     return Err(Error::Unchanged(address.to_string()));
                 }
-                let mut w = vec![(address.home(), Some(fact_file(address, value, prov)))];
+                let description = given.clone().or(current.front.description);
+                check_description(description.as_deref(), value)?;
+                let mut w = vec![(
+                    address.home(),
+                    Some(fact_file(address, value, description.as_deref(), prov)),
+                )];
                 m.close_superseded(
                     &mut w,
                     &[address.home()],
@@ -632,6 +667,43 @@ impl Memory {
                     prov,
                 )?;
                 Ok(w)
+            },
+        )
+    }
+
+    /// Change only a fact's description, on main (the core's to edit; a
+    /// shard gives one with its `set`, and the core reviews it). The value
+    /// and its provenance stay as they are; the commit says who changed the
+    /// description and why.
+    pub fn describe(
+        &self,
+        address: &Address,
+        description: &str,
+        prov: &Provenance,
+    ) -> Result<String> {
+        if let Context::Shard(s) = &self.context {
+            return Err(Error::Description(format!(
+                "shard `{s}` can't edit descriptions: the core does, on main. Give one with \
+                 `mem set ... --description \"...\"` when you create a fact"
+            )));
+        }
+        let prov = self.effective(prov, true)?;
+        self.locked_commit(
+            "describe",
+            address.as_str(),
+            &[address.home()],
+            &prov,
+            &[("Address", address.to_string())],
+            |m, _| {
+                let mut f = m
+                    .read_at("HEAD", address)?
+                    .ok_or_else(|| Error::UnknownAddress(address.to_string()))?;
+                let d = check_description(Some(description), &f.value)?;
+                if f.front.description == d {
+                    return Err(Error::Unchanged(address.to_string()));
+                }
+                f.front.description = d;
+                Ok(vec![(address.home(), Some(f.render()))])
             },
         )
     }
@@ -711,6 +783,15 @@ impl Memory {
         let mut out = Vec::new();
         for commit in log.lines() {
             if let Some(f) = self.read_at(commit, address)? {
+                // A description-only edit (`mem describe`) is not a new
+                // version of the value: list the version once, at the
+                // commit that wrote the value.
+                if let Some(e) = out.last_mut().filter(|e: &&mut HistoryEntry| {
+                    e.value == f.value && e.updated == f.front.updated
+                }) {
+                    e.commit = commit.to_string();
+                    continue;
+                }
                 out.push(HistoryEntry {
                     commit: commit.to_string(),
                     value: f.value,
@@ -924,10 +1005,16 @@ pub(crate) fn main_write(op: &str, target: &str, prov: &Provenance) -> String {
 }
 
 /// Render a fact file for `address` with `prov`'s provenance.
-pub(crate) fn fact_file(address: &Address, value: &str, prov: &Provenance) -> String {
+pub(crate) fn fact_file(
+    address: &Address,
+    value: &str,
+    description: Option<&str>,
+    prov: &Provenance,
+) -> String {
     FactFile {
         front: FrontMatter {
             address: address.to_string(),
+            description: description.map(String::from),
             updated: prov.timestamp(),
             author: prov.author.clone(),
             human: prov.human.clone().filter(|h| !h.is_empty()),
@@ -937,6 +1024,27 @@ pub(crate) fn fact_file(address: &Address, value: &str, prov: &Provenance) -> St
         value: value.to_string(),
     }
     .render()
+}
+
+/// A description is one line saying what the fact is. It must never carry
+/// the value, so the index can't become a second home for it.
+pub(crate) fn check_description(d: Option<&str>, value: &str) -> Result<Option<String>> {
+    let Some(d) = d.map(str::trim).filter(|d| !d.is_empty()) else {
+        return Ok(None);
+    };
+    if d.contains('\n') || d.contains('\r') {
+        return Err(Error::Multiline {
+            field: "description",
+        });
+    }
+    let v = value.trim();
+    if v.chars().count() >= 3 && d.to_lowercase().contains(&v.to_lowercase()) {
+        return Err(Error::Description(format!(
+            "the description contains the value ({v}); say what the fact is, not what it is \
+             set to, so the index never holds a copy of a value"
+        )));
+    }
+    Ok(Some(d.to_string()))
 }
 
 fn check_value(value: &str) -> Result<()> {
