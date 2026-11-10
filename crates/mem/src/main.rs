@@ -1286,9 +1286,17 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Cmd::Get { address } => {
             let mem = Memory::open(&cli.memory)?;
-            let f = mem.get(&Address::parse(&address)?)?;
+            let (f, from_main) = mem.get_listed(&Address::parse(&address)?)?;
             writeln!(out, "{}", f.value)?;
-            writeln!(out, "home: {}", f.home)?;
+            if from_main {
+                writeln!(
+                    out,
+                    "home: {} (read from main: it reached main after this shard opened)",
+                    f.home
+                )?;
+            } else {
+                writeln!(out, "home: {}", f.home)?;
+            }
         }
         Cmd::Set {
             address,
