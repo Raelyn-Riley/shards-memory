@@ -24,9 +24,9 @@ pane, so it remembers what it has reasoned about. Built so far: facts, supersede
 history, pointers, shards (each a session in its own pane), dinit, proposals,
 conflicts, soul approval, locks with lease-based crash recovery, the board, the watcher, the core
 session (pane wakes, watchdog, handoff, keep-warm), the known-quirks board, notes
-with owners, and a fake-data generator. Shard
-inits and dinits (soul, profile, first message), bulletins, the drift checker and the
-web UI come later. See [`docs/design.md`](docs/design.md) for the
+with owners, open questions and incidents, the inits every session starts with, the
+fact index, and a fake-data generator. Bulletins, the drift checker and the web UI come
+later. See [`docs/design.md`](docs/design.md) for the
 design. Licensed AGPL-3.0-or-later.
 
 ## Build
@@ -66,9 +66,11 @@ Global: `-C, --memory <dir>` (or `SHARDS_MEMORY`) picks the memory and defaults 
 
 | Command | Example |
 | --- | --- |
-| `mem init <dir>` creates a new memory (`facts/`, `soul/`, `people/`, README, `.gitignore`, a default `shards.toml`, first commit). | `mem init ~/flock-memory` |
-| `mem get <address>` prints the value, then `home: <path>`. An unknown address exits 1. | `mem get devices/rotoforge-ctl/ip` |
-| `mem set <address> <value> --why ...` creates a **new** fact. Every fact and people write needs a `--why`; without one it is refused with a message telling the agent to say why. It refuses only an exact existing address (use `supersede`). Near-duplicates such as the same name elsewhere are left to the later drift checker, which flags them for a human. | `mem set devices/rotoforge-ctl/ip 10.0.4.40 --why "first seen on the bench"` |
+| `mem init <dir>` creates a new memory (`facts/`, `soul/` with `core.md` and the two [inits](#inits), `people/`, README, `.gitignore`, a default `shards.toml`, first commit). | `mem init ~/flock-memory` |
+| `mem get <address>` prints the value, then `home: <path>`. An unknown address exits 1. From a shard, a fact that reached main after the shard opened is read from main, and says so. | `mem get devices/rotoforge-ctl/ip` |
+| `mem index [section] [--json]` lists every fact's address with its one-line description, and **no values**. From a shard, its own facts not on main yet are marked pending. See [The index](#the-index). | `mem index devices` |
+| `mem describe <address> <text> --why ...` changes only a fact's description, on main (the core's to edit). | `mem describe shop/hours "When the shop floor is open" --why "tidy"` |
+| `mem set <address> <value> --why ... [--description ...]` creates a **new** fact. `--description` (or `--desc`) says in one line what the fact is, never its value; `mem index` lists it, and `supersede` keeps it. Every fact and people write needs a `--why`; without one it is refused with a message telling the agent to say why. It refuses only an exact existing address (use `supersede`). Near-duplicates such as the same name elsewhere are left to the later drift checker, which flags them for a human. | `mem set devices/rotoforge-ctl/ip 10.0.4.40 --why "first seen on the bench"` |
 | `mem supersede <address> <value> --why ...` replaces an existing fact's value as one commit that touches only that file. | `mem supersede devices/rotoforge-ctl/ip 10.0.4.41 --why "moved to the new switch"` |
 | `mem set\|supersede\|put ... --answers <question>` (from a shard) records the person's answer to an open question. It must be about the question's fact or path, and the question must be open. At dinit it is a proposal like any other. See [Open questions](#open-questions). | `mem supersede lathe/two/spindle "replaced 2026-11-03" --why "Cleo helped fit it" --answers ask1` |
 | `mem history <address>` shows every version, newest first: time, commit, author, human, why and value. Under a version accepted from a proposal it lists the shard's **drafts**: its in-between values and reasons before the dinit, marked as never on main. Drafts of proposals not accepted come last, with their status. | `mem history devices/rotoforge-ctl/ip` |
@@ -78,8 +80,8 @@ Global: `-C, --memory <dir>` (or `SHARDS_MEMORY`) picks the memory and defaults 
 | `mem put <note> [file\|-] --for PERSON --why ...` writes the note into `notes/<person>/`. `notes/kiln.md` and `kiln.md` both become `notes/<person>/kiln.md`. The person matches an existing folder in any case; a new folder is lowercase. Without `--for`, `notes/<file>.md` is a shared note, as before. | `mem put notes/kiln.md --for ada --why "vent tip"` |
 | `mem notes find <word> --for PERSON [--json]` searches every note for the word (any case, in its text or path). From a shard it searches the shard's branch and main. It lists that person's own notes (their folder in any case) first, then the shared notes, then everyone else's, newest first within each. Each result names whose note it is and its date. | `mem notes find kiln --for ada` |
 | `mem shard open --id <id> [--human <name>]` creates branch `shard/<id>` from main in its own worktree and prints the worktree path. | `cd "$(mem shard open --id s7 --human Ada)"` |
-| `mem shard start [--id <id>] --human <name>` opens a shard (as `shard open` does) and starts its session in its own pane, pinned to a session id. Blank for now: no first message. The id defaults to the first free `s<n>`. | `mem shard start --human Ada` |
-| `mem shard start --id <id> --resume` brings a stopped shard's pinned session back by its id. A no-op if it is running. | `mem shard start --id s7 --resume` |
+| `mem shard start [--id <id>] --human <name>` opens a shard (as `shard open` does) and starts its session in its own pane, pinned to a session id, with its [init](#inits) and `mem shard context` as its first context. The person speaks first. The id defaults to the first free `s<n>`. | `mem shard start --human Ada` |
+| `mem shard start --id <id> --resume` brings a stopped shard's pinned session back by its id, with its init again (as its system prompt, not a message). A no-op if it is running. | `mem shard start --id s7 --resume` |
 | `mem shard stop --id <id>` ends the session cleanly (`/exit`) and closes its pane. Branch, worktree and pin stay. | `mem shard stop --id s7` |
 | `mem shard attach --id <id> [--print]` attaches your terminal to the shard's pane, or prints the tmux command. | `mem shard attach --id s7` |
 | `mem shard send --id <id> <text\|->` types one message into the shard's pane and confirms it in that session's transcript. | `mem shard send --id s7 "hello"` |
@@ -93,7 +95,7 @@ Global: `-C, --memory <dir>` (or `SHARDS_MEMORY`) picks the memory and defaults 
 | `mem proposal hold <id> [--change N] --why ... --ask "<question>"` leaves main as it is and waits for a human; deciding a held change needs `--human`. The ask is required: it becomes an open question for the next person who can answer. | `mem proposal hold p3 --change 3 --why "only said in passing" --ask "Mike mentioned he replaced the spindle. Would you confirm it?"` |
 | `mem question list [--all] [--json]` / `mem question show <id> [--json]` lists open questions, or shows one: the ask, the held change, who said it and why, answers waiting for the core, and everything since. | `mem question show ask1` |
 | `mem question dont-know <id> --why ...` (from a shard) records that the person asked doesn't know. The question stays open for the next person. | `mem question dont-know ask1 --why "Basil was off that week"` |
-| `mem shard context [--id <id>]` is what a shard should know at the start of a session: who it is with, and the open questions this person may answer. In a pane the id defaults to the pane's shard. | `mem shard context` |
+| `mem shard context [--id <id>]` is what a shard should know at the start of a session: who it is with, their profile, the open questions this person may answer (with any earlier rejected answer's reason), and the newest open quirks. In a pane the id defaults to the pane's shard. A new shard gets it after its init. | `mem shard context` |
 | `mem resolve-conflict <address\|path.md> --take shard\|main\|<value> --why ... [--shard <id>]` settles a recorded conflict on main. A person's pick is final: no proposal review. Needs the settler's name (`--human`, or the shard's human from a pane) and `--why`, and writes an incident. | `mem resolve-conflict devices/ctl/ip --take shard --human Cleo --why "s7's switch is live"` |
 | `mem incident list [--json]` / `mem incident show <id> [--json]` lists incidents, newest first, or shows one: both sides, who settled it, their reason, and notes. | `mem incident show i2` |
 | `mem incident note <id> <text\|-> --why ...` adds a note to an incident (the core's, usually; not from a shard). Notes are appended; nothing is removed. | `mem incident note i2 "the probe reads 20 low" --why "second conflict this month"` |
@@ -101,7 +103,9 @@ Global: `-C, --memory <dir>` (or `SHARDS_MEMORY`) picks the memory and defaults 
 | `mem board [--json]` shows every open shard (human, state, pane, gist, last activity, facts in flight, last few actions), then overlaps, open conflicts, soul proposals, proposals, open questions and recent incidents. Takes no lock. | `mem board --json` |
 | `mem watch [--once]` evaluates the triggers every `[intervals] watch_poll_secs`, records events and wakes the core. `--once` runs one pass and exits. | `mem watch --once` |
 | `mem core context` prints `mem board --json` and the pending events as one JSON document: everything a woken core needs. | `mem core context` |
-| `mem core start [--resume]` starts the core in its own tmux pane with a first message, and pins its session id. A no-op if it is running. `--resume` resumes the pinned session instead of starting a fresh one. | `mem core start` |
+| `mem core name <name> --why ...` the core picks the agent's name, once (`soul/name.md`). A second pick is refused; after that only an admin changes it. Not from a shard. | `mem core name Wren --why "first boot"` |
+| `mem core init` prints the core's init as its next session will get it. | `mem core init` |
+| `mem core start [--resume]` starts the core in its own tmux pane with its [init](#inits) and a first message, and pins its session id. A no-op if it is running. `--resume` resumes the pinned session instead of starting a fresh one. | `mem core start` |
 | `mem core status [--json]` shows whether the pane is up and the command alive, the pinned session, the last wake, the watchdog and keep-warm. | `mem core status` |
 | `mem core attach [--print]` attaches your terminal to the core's pane, or prints the tmux command. | `mem core attach` |
 | `mem core ack [--upto N]` marks pending events up to `N` as handled. The default is the newest event the core was woken for. | `mem core ack --upto 17` |
@@ -166,8 +170,10 @@ session and the attach command.
   `.shards/shards/<id>.json` under `session`. So a blank session is pinned even though
   Claude Code writes no transcript until its first message. The core finds its id from
   the transcript after its first message instead; a blank shard has no first message.
-- **Blank for now.** A shard starts with no soul, profile or first message. Inits and
-  dinits come later; `ShardLaunch` in `shardsession.rs` is where they plug in.
+- **Started with its init.** A shard's first context is main's `soul/init-shard.md`
+  followed by its `mem shard context` (see [Inits](#inits)). It has no first message:
+  the person speaks first. A memory without `soul/init-shard.md` starts shards blank,
+  as before.
 - **Up until someone is done.** Nothing stops a shard's pane for being idle or stale:
   not the board, not the watcher. It stays up until `mem shard stop`, or until a clean
   `mem dinit` closes the shard, which stops the session first.
@@ -259,7 +265,11 @@ the dinit's own merge commit. The record lists each change:
 - the path and the fact address;
 - the proposed `value` and `main_value`, main's value when the proposal was made;
 - the shard's `why`, its `author` (the shard id) and when it made the change;
-- `status`: `pending`, `held`, `accepted`, `rejected`, `conflict` or `answered`;
+- `status`: `pending`, `held`, `accepted`, `rejected`, `conflict`, `answered` or
+  `fixed` (held, then newer information about the fact reached main; `fixed_by` says
+  what: `p4#1`, an incident `i2`, or a write on main);
+- `description`, when the shard gave the fact a description (it reaches main with the
+  fact);
 - `drafts`, when the shard changed the path more than once before its dinit: every
   in-between version, oldest first, with its value, reason, time and shard commit.
   Drafts were never on main. They are kept for debugging: why the shard thought what
@@ -341,6 +351,20 @@ it and why, a `log` of everything since, and `closed` once it closes.
   didn't know.
 - **A human decides the held change directly** (`mem proposal accept p3 --change 2
   --human Mike --why ...`): the question closes with it.
+- **Superseded is fixed.** When the fact a question is about gets newer information on
+  main (a change the core accepts from anyone, a conflict a person settles, a write on
+  main), the question closes as `fixed` (`closed.action`), linked to what fixed it
+  (`closed.by_change`: `p4#1`, `i2`, or `supersede <address> on main by <who>`), and its
+  held change becomes `fixed` with `fixed_by`. Both are logged, in the same commit as
+  the new information. A rejected answer is not new information.
+- **Check first.** On every conflict, answer and held change, the core runs a harmless
+  check when there is one (read-only: ping, read a config or label file, ask a device
+  what it reports; never anything that writes, moves or actuates) before it decides or
+  asks a person, and writes the check and its result into its `--why`. If the check
+  disagrees with an answer, it rejects the answer with the result; the question stays
+  open, and the next shard's context shows that result to the next person. The rule is
+  in the core's init, `soul/core.md`, and every `mem core context` (`rule`). There is
+  no check framework: it is the core using its tools by a rule.
 
 Nothing in a question is removed. `mem board` and `mem core context` list open
 questions.
@@ -675,8 +699,9 @@ The command's stdout and stderr go to the watcher's. The command may run for up 
   processes. It is guarded by an `flock` on `.shards/wake.lock`. During a wake, other
   passes keep recording events.
 
-A woken core reads one thing: `mem core context`. That is `{"format":1, "board":
-<mem board --json>, "events": [<pending events>]}`. The command is whatever the operator
+A woken core reads one thing: `mem core context`. That is `{"format":1, "rule":
+"<check first>", "board": <mem board --json>, "events": [<pending events>],
+"ack_upto": <n>}`. The command is whatever the operator
 chooses. For example (not run by anything in this repo, and never in tests):
 
 ```toml
@@ -706,8 +731,8 @@ shard's pane (`mem`'s directory, plus `~/.local/bin` and `~/bin` when they exist
 a bare `claude` and `mem` start from `mem core start`, the watchdog and `rinit` even
 when the core's tmux server has a bare `PATH`. The core's command
 (`[core] command`, default `claude`) is typed into that shell in `[core] cwd`, which
-defaults to the memory root. Its first message tells it to read `soul/` and run
-`mem core context`. The message is written to `.shards/core/first-message.md` and passed
+defaults to the memory root. Its init (see [Inits](#inits)) rides as its system prompt,
+and its first message tells it to read `soul/core.md` and run `mem core context`. The message is written to `.shards/core/first-message.md` and passed
 on the command line as `-- "$(cat <file>)"`, so only a short line is ever typed,
 however long the message is. Starting a running core does nothing.
 
@@ -817,6 +842,86 @@ into warm and cold. It records numbers only, under the same privacy rule as the 
 The core's transcript is read for times, prompt counts and token counts, and no prompt
 or reply text is stored or printed. A prompt is checked for one thing only, whether it
 is exactly `[HH:MM]`.
+
+## Inits
+
+Every session starts with its init: who the agent is and how it works. The inits live
+in the memory's soul, so they follow the soul's rules: changing one on main needs a
+human admin (`mem put soul/init-shard.md --human <admin>`), and a change made on a
+shard is only a soul proposal for `mem soul approve`.
+
+| File | What it is |
+| --- | --- |
+| `soul/init-core.md` | The core's init. |
+| `soul/init-shard.md` | Every shard's init. |
+| `soul/name.md` | The agent's name. The core picks it once, on its first boot (`mem core name`). |
+| `soul/core.md` | How the core's machinery works (wakes, acks, heartbeats, handoff). |
+
+`mem init` writes both inits from the templates in `crates/shards-core/templates/`.
+Site-specific words are placeholders for an admin to fill in: `<org>` (the shop's
+name) and `<answers-to>`. `<name>` is filled in from `soul/name.md` when an init is
+delivered. Until the core has picked a name, its init ends with "pick your name now,
+once" and how to record it; a shard's says the core hasn't picked one yet.
+
+**Delivery.** An init is read from main's committed soul at every launch, never from a
+worktree or an uncommitted edit, so a shard can't change its own. It is written to
+`.shards/core/init.md` (the core) or `.shards/sessions/<id>.init.md` (a shard: the init,
+then `mem shard context` under `# This session`). With the `claude-code` adapter it is
+passed as `--append-system-prompt "$(cat <file>)"` on **every** launch: a fresh start, a
+resume, a watchdog restore and a handoff.
+
+- **Why the system prompt, not a first message.** A first message is one turn of the
+  chat, and a long session compacts it into a summary. The system prompt goes with
+  every request, so the init holds for the whole session.
+- **A resume isn't fed it twice.** It is passed again as the system prompt, never typed
+  as a message, so the conversation never holds two copies. Claude Code 2.1.322 records
+  a conversation's system prompt on its first request and resends that record on every
+  later request and resume until the conversation is compacted; then it renders it
+  again from the running launch's flags. Passing the init on a resume is what keeps it
+  there after a compaction. A resumed shard's `# This session` part is the one recorded
+  at its first start until then; `mem shard context` gives the current one.
+- **Other adapters.** The `plain` adapter has no system prompt: the core's init opens
+  its first message, and a shard gets a typed `[INIT] read <file> and follow it`.
+- **Older memories.** With no init file, sessions start as before: the core with its
+  first message, shards blank.
+
+Seen on Claude Code 2.1.322 (haiku), in a throwaway memory with fake data. The core's
+process carried `soul/init-core.md` as its appended system prompt, byte for byte. It
+read `soul/core.md`, ran `mem core context`, and picked its name with `mem core name`.
+A shard started for a fake person carried its init and `# This session`. It looked a
+fact up with `mem index`, then `mem get`. It recorded a change with `mem supersede ...
+--why "..."`, then summarized and dinited when the person said they were done. Woken
+for the proposal, the core pinged the fact's device (read-only), wrote the result into
+its reason, and held the change with a question.
+
+## The index
+
+`mem index [section]` lists every fact's address (its path under `facts/`) with a
+one-line description, and no values, so it can never become a second home for a
+fact. Look an address up there, then read the value with `mem get`.
+
+```text
+$ mem index devices
+devices/mill3/controller  Make and model of mill 3's controller
+devices/mill3/ip          IP address of mill 3's controller
+devices/lathe2/ip         IP address of lathe 2's controller  [pending: new on this shard, not on main yet]
+
+3 facts. Values aren't listed: read one with mem get <address>.
+```
+
+- **Where descriptions come from.** The fact file's `description` line. The writer
+  gives it with `mem set --description "..."`. `supersede` keeps it, or replaces it
+  with `--description`, and the core edits it with `mem describe`. A description that
+  contains the value (three characters or more, any case) is refused. `mem set`
+  without one works, and says the index will list the fact without one.
+- **From main** it lists main. **From a shard** it lists main as it is now, plus the
+  shard's own facts that aren't on main yet, marked `new`, `changed` or `removed`. A
+  fact that reached main after the shard opened is listed, and `mem get` from the
+  shard reads it from main. `mem get` reads a fact the shard has as the shard has it.
+- **From a proposal.** A shard's description travels in its proposal (`description`)
+  and reaches main with the fact when the core accepts it. Otherwise the fact keeps
+  main's description.
+- `--json` gives `[{"address", "description", "pending"}]`.
 
 ## Known quirks
 
@@ -996,8 +1101,9 @@ Local state that is never committed lives in `.shards/`: `worktrees/`, `shards/`
 (shard records), `status/`, `locks/`, `lock.log`, `activity/` (per-shard activity
 summaries and transcript offsets), `events.jsonl`, `watch.json` (watcher state),
 `wake.log`, `core/` (`session.json`, `state.json`, `core.log`, `usage.jsonl`,
-`first-message.md`, `core.lock` and the tmux socket) and `sessions/` (the shards' tmux
-socket, `sessions.log`, and a lock per shard that serializes start, stop and send).
+`first-message.md`, `init.md`, `core.lock` and the tmux socket) and `sessions/` (the
+shards' tmux socket, `sessions.log`, each shard's `<id>.init.md`, and a lock per shard
+that serializes start, stop and send).
 
 Address rules: at least `section/name`. Segments use only `a-z 0-9 - _ .`, start with a
 letter or digit, and carry no `facts/` prefix or `.md` suffix. Lowercase only, so two
@@ -1008,6 +1114,7 @@ homes can't differ just by case.
 ```markdown
 ---
 address: "devices/rotoforge-ctl/ip"
+description: "the rotoforge controller's address on the shop network"
 updated: "2026-11-03T15:04:05Z"
 author: "shard-7f3a"
 human: "Tess"
@@ -1019,7 +1126,9 @@ why: "moved to the new switch"
 - The file opens with YAML front matter. Keys come in the fixed order above, and each
   value is a double-quoted string with JSON escaping, which is also valid YAML.
 - `updated` is RFC 3339 UTC, written by the tool. It is never edited by hand.
-- `human` is omitted when no human is known. `author`, `human` and `why` are single-line.
+- `human` is omitted when no human is known, and `description` when there is none.
+  `author`, `human`, `why` and `description` are single-line.
+- `description` says what the fact is, for `mem index`; it never holds the value.
 - A fact accepted from a proposal adds `proposal: "p3#2"`, `reviewed_by` and
   `review_why` after `why`. `author`, `human` and `why` stay the shard's.
 - The body is the value followed by exactly one newline. Values may span several lines.
@@ -1048,6 +1157,8 @@ Shards-Why: moved to the new switch
   - `resolve-conflict`: the target, plus `Shards-Target`, `Shards-Shard` and
     `Shards-Take`. The commit also writes the incident.
   - `incident-note`: the incident id, plus `Shards-Incident`.
+  - `describe`: the address, plus `Shards-Address`. Only the description changes.
+  - `name`: the name the core picked, plus `Shards-Name`.
   - `question-dont-know`: the question id, plus `Shards-Question`.
   - A fact or people write from a shard that answers a question adds
     `Shards-Answers`.
